@@ -1,5 +1,6 @@
 """
 Oracle-1 · Inference Script
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 ============================
 
 Запускает обученную модель в нескольких режимах:
