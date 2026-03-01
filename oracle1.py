@@ -1,5 +1,6 @@
 # ================================================================
 # Oracle-1: Graph-Native Knowledge Model
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 # All the code is in one file to make it easier for you to send it to the chatbot for analysis.
 # ================================================================
 
