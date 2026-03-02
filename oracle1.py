@@ -1,6 +1,5 @@
 # ================================================================
 # Oracle-1: Graph-Native Knowledge Model
-# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 # All the code is in one file to make it easier for you to send it to the chatbot for analysis.
 # ================================================================
 
@@ -500,7 +499,28 @@ CONFIG: Dict[str, Any] = {
     },
 
     # ── Consolidation engine ──────────────────────────────────────────────────
-    "consolidation_conflict_variance_threshold": 2.0,  # std above this → conflict
+    "consolidation_conflict_variance_threshold": 2.0,  # std above this → conflict (0-10 score fields)
+    "consolidation_physical_conflict_threshold": 0.20, # std above this → conflict for 0-1 physical axes
+    "consolidation_graph_prior_trust": 1.0,  # trust weight of existing graph node used as prior observation
+
+    # ── Edge semantic validation (optional LLM pass) ─────────────────────────
+    # Master switch.  When False (default) the entire validator is bypassed with
+    # zero LLM overhead.  Enable to catch cross-domain nonsense connections such
+    # as fictional political events linked to real scientific discoveries.
+    "edge_validation_enabled":        False,
+    # Minimum plausibility score returned by LLM to keep the edge.
+    # Edges below this threshold are dropped and logged.
+    "edge_validation_min_score":      0.40,
+    # Maximum edges per single LLM call (batching reduces API overhead).
+    "edge_validation_batch_size":     12,
+    # Which edge categories to validate.  Remove entries to skip that pass.
+    #   "intra_doc"  — edges within a single document (Pass C)
+    #   "cross_doc"  — semantic cross-document edges found by BucketIndex / Pass D
+    #   "graph_load" — final gate in load_result_into_graph before add_edge()
+    "edge_validation_passes":         ["intra_doc", "cross_doc"],
+    # If True, edges that time out or cause LLM errors are KEPT (fail-open).
+    # If False, they are dropped (fail-closed / conservative mode).
+    "edge_validation_fail_open":      True,
 
     # ── Rupture report display ────────────────────────────────────────────────
     "rupture_report_node_text_len":   50,
@@ -1701,6 +1721,49 @@ class RuntimeGraph:
 
     def add_zone(self, zone: TemporalZone):
         self.zones[zone.id] = zone
+
+    def remove_node(self, node_id: str) -> None:
+        """Remove a node and clean up ALL associated indices.
+
+        Removes from: nodes dict, temporal_sorted, domain_clusters,
+        and rebuilds _incoming_ids from the remaining edges so that
+        AncestryEnforcer.has_incoming_edge() never refers to a dead node.
+
+        Callers must remap/delete all edges touching this node first.
+        """
+        node = self.nodes.pop(node_id, None)
+        # Remove from temporal_sorted (maintains sorted order, just filters)
+        self.temporal_sorted = [
+            (ts, nid) for ts, nid in self.temporal_sorted if nid != node_id
+        ]
+        # Remove from domain_clusters
+        domain = getattr(node, "domain", None) if node else None
+        if domain and domain in self.domain_clusters:
+            try:
+                self.domain_clusters[domain].remove(node_id)
+            except ValueError:
+                pass
+        else:
+            # Slower fallback: scan all clusters
+            for id_list in self.domain_clusters.values():
+                if node_id in id_list:
+                    id_list.remove(node_id)
+                    break
+        # Rebuild _incoming_ids so the cache is consistent with remaining edges
+        self._rebuild_incoming_cache()
+
+    def _rebuild_incoming_cache(self) -> None:
+        """Recompute _incoming_ids from scratch.
+
+        Must be called after any operation that adds, removes, or remaps edges
+        so that has_incoming_edge() always reflects the true graph state.
+        """
+        self._ensure_cache()
+        self._incoming_ids = {
+            tgt
+            for (src, tgt), edge in self.edges.items()
+            if not edge.is_containment_edge
+        }
 
     def get_node(self, nid: str) -> Optional[KnowledgeNode]:
         return self.nodes.get(nid)
@@ -5966,6 +6029,230 @@ class ResponseValidator:
         return result
 
 
+# ── Layer 5b: Edge Semantic Validator (optional LLM pass) ────────────────────
+#
+# Enabled via CONFIG["edge_validation_enabled"] = True.
+#
+# The validator batches proposed edges and asks the LLM a single structured
+# question: is each connection semantically plausible given the two node
+# descriptions, their domains, entity types, and the stated relationship?
+#
+# Classic example it catches:
+#   source: "1984 (Orwell novel)"  entity_type=fictional_event  domain=literature
+#   target: "Room 101 CIA torture programme"  domain=military_intelligence
+#   relationship: DERIVED_FROM
+#   => LLM: plausibility 0.12 -- fictional political event != real science
+#
+# Each edge gets a plausibility score [0-1] and a one-sentence rationale.
+# Edges below CONFIG["edge_validation_min_score"] are dropped and logged.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EdgeSemanticValidator:
+    """LLM-based plausibility filter for proposed KnowledgeEdge connections.
+
+    Usage (inside IngestionPipeline)::
+
+        validator = EdgeSemanticValidator(llm_annotator)
+        kept, dropped = validator.validate_batch(edges, node_lookup)
+
+    *node_lookup* is a Dict[str, KnowledgeNode] — both endpoints must be present.
+    Returns ``(kept_edges, dropped_edges)``.  Dropped edges carry a
+    ``__validation_rationale`` key in their ``__dict__`` for diagnostics.
+
+    When ``CONFIG["edge_validation_enabled"]`` is False the class is
+    instantiated but ``validate_batch()`` is a no-op that returns
+    ``(edges, [])`` immediately with zero LLM overhead.
+    """
+
+    EDGE_VALIDATION_PROMPT = """\
+You are an expert knowledge-graph curator validating proposed edges in a \
+scientific / technological / historical knowledge graph.
+
+Your task: for each proposed edge decide whether the connection is \
+semantically plausible and factually defensible given the two node \
+descriptions and the stated relationship type.
+
+━━━ DROP RULES (any one is sufficient to drop) ━━━
+1. FICTIONAL → REAL  boundary crossing
+   Fictional characters, events, or organisations (literature, films, games)
+   linked to real-world science, politics, or history as a direct causal
+   influence.  Example: "Room 101 from 1984 (Orwell)" → "CIA interrogation
+   doctrine" with relationship DERIVED_FROM.
+2. CHRONOLOGICAL IMPOSSIBILITY
+   The source node's year is AFTER the target's year and the relationship
+   implies the source caused or enabled the target.
+3. EPISTEMIC DOMAIN MISMATCH without documented bridge
+   Connecting social media content / fan speculation directly to
+   peer-reviewed discoveries as a causal link (not as "commentary on").
+4. CONTRADICTORY RELATIONSHIP TYPE
+   Relationship type is inconsistent with node types (e.g. a person node
+   DERIVED_FROM a physical law).
+5. CONFIDENCE < 0.15 AND semantic_similarity < 0.20
+   Near-zero strength with no supporting evidence — likely a hallucinated edge.
+
+━━━ KEEP RULES ━━━
+- Both nodes real AND share the same epistemic register (both scientific,
+  both political, both fictional).
+- Relationship is historically or scientifically documented.
+- Cross-domain connections are acceptable when the relationship type is
+  "influenced_by", "commentary_on", "inspired_by" — not "DERIVED_FROM",
+  "ENABLES", or "CAUSED_BY".
+
+━━━ SCORING GUIDE ━━━
+  1.0  — obvious, well-documented connection
+  0.7  — plausible, no strong counter-evidence
+  0.4  — uncertain / weak but possible (threshold by default)
+  0.2  — unlikely, domain mismatch or weak evidence
+  0.0  — clearly wrong (fictional→real causal, impossible chronology)
+
+EDGES TO EVALUATE:
+{edges_block}
+
+OUTPUT (ONLY valid JSON, NO markdown fences, no extra keys):
+{{
+  "results": [
+    {{
+      "edge_id": "<id>",
+      "plausibility": <0.0-1.0>,
+      "verdict": "<keep or drop>",
+      "rationale": "<one sentence explaining the decision, max 25 words>"
+    }}
+  ]
+}}
+
+IMPORTANT: verdict must be exactly "keep" or "drop" — never any other value.\
+"""
+
+    MAX_TOKENS = 1024
+
+    def __init__(self, annotator):
+        self.annotator  = annotator
+        self.enabled    = CONFIG.get("edge_validation_enabled", False)
+        self.min_score  = CONFIG.get("edge_validation_min_score", 0.40)
+        self.batch_size = CONFIG.get("edge_validation_batch_size", 12)
+        self.fail_open  = CONFIG.get("edge_validation_fail_open", True)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def validate_batch(self, edges, node_lookup):
+        """Filter *edges* through the LLM plausibility check.
+
+        Returns ``(kept, dropped)``.  When validation is disabled returns
+        ``(edges, [])`` immediately with zero LLM overhead.
+        """
+        if not self.enabled or not edges:
+            return list(edges), []
+
+        kept, dropped = [], []
+        for i in range(0, len(edges), self.batch_size):
+            batch = edges[i : i + self.batch_size]
+            b_kept, b_dropped = self._validate_batch_chunk(batch, node_lookup)
+            kept.extend(b_kept)
+            dropped.extend(b_dropped)
+
+        if dropped:
+            logger.info(
+                f"[EdgeValidator] Dropped {len(dropped)}/{len(edges)} edge(s) "
+                f"(min_score={self.min_score}):"
+            )
+            for e in dropped:
+                rationale = e.__dict__.get("__validation_rationale", "no rationale")
+                logger.info(
+                    f"  x {e.source_id} -> {e.target_id} "
+                    f"[{e.relationship_type}] -- {rationale}"
+                )
+        return kept, dropped
+
+    # ── Internals ───────────────────────────────────────────────────────────
+
+    def _validate_batch_chunk(self, edges, node_lookup):
+        """Send one LLM call for a single batch of <= batch_size edges."""
+        edge_lines = []
+        for idx, edge in enumerate(edges):
+            src = node_lookup.get(edge.source_id)
+            tgt = node_lookup.get(edge.target_id)
+            edge_lines.append(self._edge_line(edge, src, tgt, idx))
+
+        prompt = self.EDGE_VALIDATION_PROMPT.format(
+            edges_block="\n\n".join(edge_lines)
+        )
+
+        response = self.annotator.call(prompt, pass_type="edge_validation")
+        if not response.success or not response.parsed:
+            logger.warning(
+                "[EdgeValidator] LLM call failed -- applying "
+                f"{'fail-open (keeping all)' if self.fail_open else 'fail-closed (dropping all)'}"
+            )
+            if self.fail_open:
+                return list(edges), []
+            for e in edges:
+                e.__dict__["__validation_rationale"] = "LLM validation failed (fail-closed)"
+            return [], list(edges)
+
+        results_map = {
+            item.get("edge_id", ""): item
+            for item in response.parsed.get("results", [])
+            if item.get("edge_id")
+        }
+
+        kept, dropped = [], []
+        for edge in edges:
+            result = results_map.get(edge.id)
+            if result is None:
+                (kept if self.fail_open else dropped).append(edge)
+                if not self.fail_open:
+                    edge.__dict__["__validation_rationale"] = "no LLM result (fail-closed)"
+                continue
+
+            score     = float(result.get("plausibility", 1.0))
+            rationale = result.get("rationale", "")
+            verdict   = result.get("verdict", "keep")
+
+            edge.__dict__["__validation_score"]     = round(score, 3)
+            edge.__dict__["__validation_rationale"] = rationale
+
+            if score >= self.min_score and verdict != "drop":
+                kept.append(edge)
+            else:
+                dropped.append(edge)
+
+        return kept, dropped
+
+    @staticmethod
+    def _edge_line(edge, src, tgt, idx):
+        """Render one edge as a structured text block for the LLM prompt."""
+        def _node_desc(n, eid):
+            if n is None:
+                return f'id="{eid}"  [node data unavailable]'
+            year = ""
+            if n.timestamp and n.timestamp != 0.0:
+                try:
+                    year = f"  year~{int(n.timestamp / (365.25*24*3600)) + 1970}"
+                except Exception:
+                    pass
+            return (
+                f'id="{n.id}"\n'
+                f'  text: "{n.text[:120]}"\n'
+                f'  domain: {n.domain}  entity_type: {n.entity_type}'
+                f'  source_type: {getattr(n, "source_type", "unknown")}{year}'
+            )
+
+        return (
+            f"--- Edge {idx + 1} (id={edge.id}) ---\n"
+            f"SOURCE NODE:\n{_node_desc(src, edge.source_id)}\n"
+            f"TARGET NODE:\n{_node_desc(tgt, edge.target_id)}\n"
+            f"RELATIONSHIP: {edge.relationship_type}\n"
+            f"  semantic_similarity={edge.semantic_similarity:.2f}  "
+            f"confidence={edge.confidence:.2f}  "
+            f"temporal_proximity={edge.temporal_proximity:.2f}\n"
+            f"  evidence: {'; '.join(edge.evidence[:2]) if edge.evidence else 'none'}"
+        )
+
+
+# Register edge_validation as a known pass_type in LLMAnnotator token budget.
+LLMAnnotator.MAX_TOKENS_PASS["edge_validation"] = 1024
+
+
 # ── Layer 5: Object assembler ─────────────────────────────────────────────────
 
 class NodeEdgeAssembler:
@@ -5987,15 +6274,40 @@ class NodeEdgeAssembler:
                        physical_scores: Optional[Dict[str, float]] = None,
                        source_trust: float = 0.7) -> KnowledgeNode:
         node_id = self.make_stable_id(source, item["text"], item.get("id"))
+
+        # Resolve the node's temporal position.
+        #
+        # The `timestamp` argument is the DOCUMENT's publication date (when this
+        # paper/article was written).  For historical technology nodes this is
+        # almost always wrong: a 2024 paper about a 1950 invention should not
+        # give that invention timestamp=2024.
+        #
+        # Priority:
+        #   1. `publication_year` extracted by the LLM for this specific node
+        #      (the year the technology/concept itself was established).
+        #   2. If absent → timestamp = 0.0 and mark date_unknown=True.
+        #      Nodes with date_unknown=True must not be created as new graph
+        #      nodes; they are only allowed to ENRICH nodes that already exist.
+        pub_year = item.get("publication_year")
+        if pub_year is not None:
+            try:
+                node_timestamp = float((int(pub_year) - 1970) * 365.25 * 24 * 3600)
+                date_unknown   = False
+            except (ValueError, TypeError):
+                node_timestamp = 0.0
+                date_unknown   = True
+        else:
+            node_timestamp = 0.0
+            date_unknown   = True
+
         node = KnowledgeNode(
             id=node_id, text=item["text"],
             full_text=item.get("full_context", ""),
             node_type=item.get("node_type", "research"),
             domain=item.get("domain", "unknown"),
             entity_type=item.get("entity_type", "research_frontier"),
-            provenance=source, timestamp=timestamp,
-            publication_date=(str(item["publication_year"])
-                              if item.get("publication_year") else None),
+            provenance=source, timestamp=node_timestamp,
+            publication_date=(str(pub_year) if pub_year else None),
             scientific_score=float(item.get("scientific_score", 5.0)) * source_trust,
             investment_score=float(item.get("investment_score", 0.0)),
             social_score=float(item.get("social_score", 0.0)),
@@ -6009,6 +6321,8 @@ class NodeEdgeAssembler:
             requires_node_ids=item.get("requires_node_ids", []),
             enables_node_ids=item.get("enables_node_ids", []),
         )
+        if date_unknown:
+            node.__dict__["date_unknown"] = True
         if self.embedder is not None:
             try:
                 feat_builder = NodeFeatureBuilder(self.embedder)
@@ -6430,6 +6744,11 @@ class IngestionResult:
     zones:             List           = field(default_factory=list)
     containment_edges: List           = field(default_factory=list)
     cross_doc_edges:   List           = field(default_factory=list)
+    # Nodes that carry no date (date_unknown=True) but matched an existing graph
+    # node via BucketIndex.  These must NOT be created as new graph nodes —
+    # they are enrichment observations and should only go through
+    # GraphConsolidator.observe_node(node, canonical_id=<matched_id>).
+    enrichment_nodes:  List[Tuple]    = field(default_factory=list)  # [(node, matched_id), ...]
     merge_suggestions: List[Tuple]    = field(default_factory=list)
     stats:             Dict[str, Any] = field(default_factory=dict)
     warnings:          List[str]      = field(default_factory=list)
@@ -6461,13 +6780,14 @@ class IngestionPipeline:
                  existing_nodes: Optional[List] = None,
                  chunk_size: int = None,
                  graph=None):
-        self.chunker   = DocumentChunker(chunk_size=chunk_size)
-        self.prompts   = IngestionPromptBuilder()
-        self.annotator = LLMAnnotator(llm_client)
-        self.validator = ResponseValidator()
-        self.assembler = NodeEdgeAssembler(embedder=embedder)
-        self.linker    = BucketIndex(existing_nodes or [])
-        self._graph    = graph
+        self.chunker        = DocumentChunker(chunk_size=chunk_size)
+        self.prompts        = IngestionPromptBuilder()
+        self.annotator      = LLMAnnotator(llm_client)
+        self.validator      = ResponseValidator()
+        self.assembler      = NodeEdgeAssembler(embedder=embedder)
+        self.linker         = BucketIndex(existing_nodes or [])
+        self.edge_validator = EdgeSemanticValidator(self.annotator)
+        self._graph         = graph
         if graph is not None and not existing_nodes:
             try:
                 for node in graph.nodes.values():
@@ -6499,6 +6819,7 @@ class IngestionPipeline:
             result.zones.extend(cr.get("zones", []))
             result.containment_edges.extend(cr.get("containment_edges", []))
             result.cross_doc_edges.extend(cr.get("pass_d_edges", []))
+            result.enrichment_nodes.extend(cr.get("enrichment_nodes", []))
             all_chunk_results.append(cr)
         if len(chunks) > 1:
             mr = self._merge_chunks(all_chunk_results, result)
@@ -6525,6 +6846,7 @@ class IngestionPipeline:
                 )
         result.stats = {
             "chunks": len(chunks), "nodes": len(result.nodes),
+            "enrichment_nodes": len(result.enrichment_nodes),
             "edges": len(result.edges), "zones": len(result.zones),
             "cross_doc_edges": len(result.cross_doc_edges),
             "merge_suggestions": len(result.merge_suggestions),
@@ -6536,6 +6858,45 @@ class IngestionPipeline:
         return result
 
     # ── Pass D: secondary contexts → existing graph nodes ─────────────────────
+
+    def _find_existing_match(self, node) -> Optional[str]:
+        """Return the graph node ID that best matches *node*, or None.
+
+        Uses BucketIndex (embedding ANN + FuzzyMatcher) — the same mechanism
+        as CrossDocumentLinker.find_connections() but for a single node.
+        A match is accepted only at MERGE_THRESHOLD (0.92 by default) to
+        ensure we don't erroneously treat a merely similar node as the same one.
+        Called exclusively for date_unknown nodes to decide:
+          - match found  → legitimate enrichment of an existing node
+          - no match     → reject (no date AND no existing target to enrich)
+        """
+        if node.embedding is None:
+            # No embedding → fall back to graph direct lookup by ID (same source)
+            if self._graph is not None and self._graph.get_node(node.id) is not None:
+                return node.id
+            return None
+
+        emb  = node.embedding
+        norm = float(np.linalg.norm(emb))
+        if norm < 1e-8:
+            return None
+
+        candidates = self.linker.get_candidates(
+            ctx_text        = node.text,
+            ctx_domain      = node.domain,
+            ctx_entity_type = node.entity_type,
+            query_embedding = emb,
+            top_k           = 5,
+        )
+        for cand in candidates:
+            if cand.get("_sim", 0.0) >= BucketIndex.MERGE_THRESHOLD:
+                return cand["id"]
+
+        # Direct graph lookup by stable ID as last resort (same source re-ingestion)
+        if self._graph is not None and self._graph.get_node(node.id) is not None:
+            return node.id
+
+        return None
 
     def _run_pass_d(self,
                     raw_node: Dict,
@@ -6694,7 +7055,7 @@ class IngestionPipeline:
                         source_type: str, domain_hint: str, trust: float) -> Dict:
         out = {"nodes": [], "edges": [], "zones": [], "containment_edges": [],
                "warnings": [], "errors": [], "llm_calls": 0, "raw_nodes": [],
-               "pass_d_edges": []}
+               "pass_d_edges": [], "enrichment_nodes": []}
 
         # ── Pass A: entities + secondary_contexts ─────────────────────────────
         ra = self.annotator.call(
@@ -6732,6 +7093,37 @@ class IngestionPipeline:
                     item, source, timestamp,
                     physical_scores=physical_map.get(item["id"]), source_trust=trust)
                 slug_map[item["id"]] = node.id
+
+                # ── Date-unknown gate ─────────────────────────────────────────
+                # A node without a date (date_unknown=True) is not allowed to
+                # enter the graph as a *new* node — the graph is a temporal
+                # knowledge structure and undated new nodes break ordering,
+                # AncestryEnforcer, and all time-based pressure calculations.
+                #
+                # Exception: if the node matches an existing graph node via
+                # BucketIndex (sim >= MERGE_THRESHOLD), it is legitimate
+                # enrichment data.  It goes into out["enrichment_nodes"] as a
+                # (node, matched_graph_id) pair; load_result_into_graph will
+                # route it to GraphConsolidator instead of add_node_checked().
+                if node.__dict__.get("date_unknown"):
+                    matched_id = self._find_existing_match(node)
+                    if matched_id is not None:
+                        out["enrichment_nodes"].append((node, matched_id))
+                        out["warnings"].append(
+                            f"Node '{node.id}' ('{node.text[:50]}'): no date — "
+                            f"treated as enrichment of existing '{matched_id}'"
+                        )
+                        # Still register slug for edge assembly so edges within
+                        # the chunk that reference this node remain valid.
+                        assembled_nodes.append(node)
+                    else:
+                        out["warnings"].append(
+                            f"Node '{node.id}' ('{node.text[:50]}'): "
+                            "no date and no match in graph — creation rejected. "
+                            "Provide publication_year to create this node."
+                        )
+                    continue  # do NOT add to out["nodes"] in either case
+
                 out["nodes"].append(node)
                 out["raw_nodes"].append(item)
                 assembled_nodes.append(node)
@@ -6769,6 +7161,18 @@ class IngestionPipeline:
                 except Exception as e:
                     out["errors"].append(f"Zone assembly failed: {e}")
 
+        # ── Pass C-V: semantic validation of intra-doc edges (optional) ────────
+        if "intra_doc" in CONFIG.get("edge_validation_passes", []):
+            node_lookup = {n.id: n for n in out["nodes"]}
+            kept, dropped = self.edge_validator.validate_batch(
+                out["edges"], node_lookup)
+            if dropped:
+                out["warnings"].append(
+                    f"Chunk {chunk.chunk_index}: EdgeValidator dropped "
+                    f"{len(dropped)} intra-doc edge(s)"
+                )
+            out["edges"] = kept
+
         # ── Pass D: secondary contexts → existing graph nodes ─────────────────
         for raw_node, assembled_node in zip(out["raw_nodes"], assembled_nodes):
             if not raw_node.get("secondary_contexts"):
@@ -6787,6 +7191,25 @@ class IngestionPipeline:
                 out["warnings"].append(
                     f"PassD failed for node '{assembled_node.id}': {e}"
                 )
+
+        # ── Pass D-V: semantic validation of cross-doc (Pass D) edges ──────────
+        if "cross_doc" in CONFIG.get("edge_validation_passes", []):
+            # Build node lookup: intra-doc nodes + graph nodes (for Pass D targets)
+            node_lookup = {n.id: n for n in out["nodes"]}
+            if self._graph is not None:
+                for nid in {e.target_id for e in out["pass_d_edges"]}:
+                    if nid not in node_lookup:
+                        gn = self._graph.get_node(nid)
+                        if gn:
+                            node_lookup[gn.id] = gn
+            kept, dropped = self.edge_validator.validate_batch(
+                out["pass_d_edges"], node_lookup)
+            if dropped:
+                out["warnings"].append(
+                    f"Chunk {chunk.chunk_index}: EdgeValidator dropped "
+                    f"{len(dropped)} cross-doc (Pass D) edge(s)"
+                )
+            out["pass_d_edges"] = kept
 
         return out
 
@@ -6877,7 +7300,9 @@ class BatchIngestionProcessor:
         return results
 
 
-def load_result_into_graph(result: IngestionResult, graph) -> Dict[str, int]:
+def load_result_into_graph(result: IngestionResult, graph,
+                            consolidator=None,
+                            edge_validator=None) -> Dict[str, int]:
     """Load an IngestionResult into a RuntimeGraph with ancestry invariant enforcement.
 
     Every non-primordial node must arrive with at least one incoming
@@ -6885,9 +7310,30 @@ def load_result_into_graph(result: IngestionResult, graph) -> Dict[str, int]:
     AncestryEnforcer synthesises a DERIVED_FROM edge to the best-matching
     predecessor already in the graph.
 
-    Returns {"nodes": N, "edges": M, "zones": K, "synthesised_ancestry": S}.
+    Parameters
+    ----------
+    result : IngestionResult
+    graph  : RuntimeGraph
+    consolidator : GraphConsolidator, optional
+        If supplied, enrichment_nodes (date_unknown observations that matched
+        an existing graph node) are routed through it rather than creating
+        new graph nodes.
+    edge_validator : EdgeSemanticValidator, optional
+        If supplied AND ``CONFIG["edge_validation_passes"]`` contains
+        ``"graph_load"``, all non-containment edges are passed through the
+        LLM plausibility filter as a final gate before ``add_edge()``.
+        This is the most conservative option — it fires even for edges
+        synthesised by AncestryEnforcer.  Containment edges are always
+        exempt (zone membership is structural, not semantic).
+
+    Returns
+    -------
+    dict with keys: nodes, edges, zones, synthesised_ancestry,
+    enrichment_routed, validation_dropped.
     """
-    added = {"nodes": 0, "edges": 0, "zones": 0, "synthesised_ancestry": 0}
+    added = {"nodes": 0, "edges": 0, "zones": 0,
+             "synthesised_ancestry": 0, "enrichment_routed": 0,
+             "validation_dropped": 0}
 
     all_edges = result.edges + result.containment_edges + result.cross_doc_edges
 
@@ -6902,6 +7348,32 @@ def load_result_into_graph(result: IngestionResult, graph) -> Dict[str, int]:
             added["synthesised_ancestry"] += 1
             added["edges"] += 1
 
+    # ── graph_load validation pass (optional) ────────────────────────────────
+    # Runs BEFORE add_edge() so bad edges never enter the graph at all.
+    # Only non-containment edges are checked; containment (zone membership)
+    # edges are structural and always trusted.
+    if (edge_validator is not None
+            and "graph_load" in CONFIG.get("edge_validation_passes", [])):
+        non_containment = [e for e in all_edges if not e.is_containment_edge]
+        containment     = [e for e in all_edges if e.is_containment_edge]
+        # Build node lookup from both the result and the live graph
+        node_lookup: Dict[str, "KnowledgeNode"] = {
+            n.id: n for n in result.nodes}
+        for edge in non_containment:
+            for nid in (edge.source_id, edge.target_id):
+                if nid not in node_lookup:
+                    gn = graph.get_node(nid)
+                    if gn:
+                        node_lookup[gn.id] = gn
+        kept, dropped = edge_validator.validate_batch(non_containment, node_lookup)
+        all_edges = kept + containment
+        added["validation_dropped"] += len(dropped)
+        if dropped:
+            logger.info(
+                f"[load_result] graph_load pass dropped "
+                f"{len(dropped)} edge(s) before add_edge()"
+            )
+
     for edge in all_edges:
         if graph.get_node(edge.source_id) and graph.get_node(edge.target_id):
             graph.add_edge(edge)
@@ -6909,10 +7381,38 @@ def load_result_into_graph(result: IngestionResult, graph) -> Dict[str, int]:
 
     added["zones"] = len(result.zones)
 
+    # Route enrichment_nodes through consolidator.
+    # These are date_unknown observations that matched an existing graph node.
+    # They must NOT be added as new graph nodes — only their field values are
+    # merged into the matched node's record.
+    if consolidator is not None and result.enrichment_nodes:
+        trust = 0.6  # slightly lower trust for dateless enrichment observations
+        for enr_node, matched_id in result.enrichment_nodes:
+            try:
+                consolidator.observe_node(
+                    enr_node,
+                    source=result.source,
+                    timestamp=graph.get_node(matched_id).timestamp
+                              if graph.get_node(matched_id) else 0.0,
+                    trust=trust,
+                    canonical_id=matched_id,
+                )
+                added["enrichment_routed"] += 1
+            except Exception as e:
+                logger.warning(
+                    f"[load_result] enrichment routing failed for "
+                    f"'{enr_node.id}' → '{matched_id}': {e}"
+                )
+
     if added["synthesised_ancestry"]:
         logger.info(
             f"[Ancestry] {added['synthesised_ancestry']} lineage edge(s) "
             "synthesised during ingestion to satisfy ancestry invariant"
+        )
+    if added["enrichment_routed"]:
+        logger.info(
+            f"[Enrichment] {added['enrichment_routed']} dateless observation(s) "
+            "routed to consolidator for existing nodes"
         )
     return added
 
@@ -6968,6 +7468,11 @@ class MergeStrategy(Enum):
     MAX                 = auto()
     MIN                 = auto()
     SUM_UNIQUE          = auto()
+    # Like SUM_UNIQUE but graph-prior-aware: the prior's accumulated total is
+    # used as the BASE; only new-source values that exceed the current base are
+    # added.  This prevents double-counting when apply_to_graph is called
+    # repeatedly (prior already contains the previously-summed total).
+    SUM_ADDITIVE_OVER_PRIOR = auto()
     UNION_LIST          = auto()
     EMBEDDING_CENTROID  = auto()
     MAJORITY_VOTE       = auto()
@@ -6991,15 +7496,15 @@ NODE_FIELD_STRATEGIES: Dict[str, MergeStrategy] = {
     "export_control_risk":  MergeStrategy.MAX,
     "strategic_value":   MergeStrategy.TRUST_WEIGHTED_MEAN,
     "efficiency_plateau":MergeStrategy.MAX,
-    "investment_rounds":         MergeStrategy.SUM_UNIQUE,
-    "investment_total_usd":      MergeStrategy.SUM_UNIQUE,
+    "investment_rounds":         MergeStrategy.SUM_ADDITIVE_OVER_PRIOR,
+    "investment_total_usd":      MergeStrategy.SUM_ADDITIVE_OVER_PRIOR,
     "investment_last_round_usd": MergeStrategy.MAX,
     "investment_lead_investors": MergeStrategy.UNION_LIST,
     "sentiment_review_score":  MergeStrategy.TEMPORAL_TREND,
     "sentiment_fiction_score": MergeStrategy.TEMPORAL_TREND,
     "sentiment_forum_score":   MergeStrategy.TEMPORAL_TREND,
     "social_perception_score": MergeStrategy.TEMPORAL_TREND,
-    "forum_post_count":        MergeStrategy.SUM_UNIQUE,
+    "forum_post_count":        MergeStrategy.SUM_ADDITIVE_OVER_PRIOR,
     "solves_limitations":MergeStrategy.UNION_LIST,
     "requires_node_ids": MergeStrategy.UNION_LIST,
     "enables_node_ids":  MergeStrategy.UNION_LIST,
@@ -7087,7 +7592,8 @@ class FieldMerger:
             MergeStrategy.TEMPORAL_TREND:      lambda: FieldMerger._temporal_trend(values, timestamps),
             MergeStrategy.MAX:                 lambda: FieldMerger._safe_max(values),
             MergeStrategy.MIN:                 lambda: FieldMerger._safe_min(values),
-            MergeStrategy.SUM_UNIQUE:          lambda: FieldMerger._sum_unique(values),
+            MergeStrategy.SUM_UNIQUE:               lambda: FieldMerger._sum_unique(values),
+            MergeStrategy.SUM_ADDITIVE_OVER_PRIOR:  lambda: FieldMerger._sum_additive_over_prior(values, weights),
             MergeStrategy.UNION_LIST:          lambda: FieldMerger._union_list(values),
             MergeStrategy.EMBEDDING_CENTROID:  lambda: FieldMerger._embedding_centroid(values, weights),
             MergeStrategy.MAJORITY_VOTE:       lambda: FieldMerger._majority_vote(values, weights),
@@ -7117,8 +7623,13 @@ class FieldMerger:
         return max(pairs, key=lambda x: x[0])[1] if pairs else None
 
     @staticmethod
-    def _temporal_trend(values, timestamps) -> float:
-        """Latest value + weak linear extrapolation capped at ±10% of the last value."""
+    def _temporal_trend(values, timestamps, value_max: float = 10.0) -> float:
+        """Latest value + weak linear extrapolation capped at ±10% of the last value.
+
+        *value_max* controls the upper clip bound:
+          - 10.0 for standard node score fields (0-10 range)
+          - 1.0  for physical substrate axes (0-1 range)
+        """
         numeric_pairs = []
         for ts, v in zip(timestamps, values):
             try:
@@ -7136,7 +7647,7 @@ class FieldMerger:
         ts_norm = (ts_arr - ts_arr.mean()) / (ts_arr.std() + 1e-8)
         slope   = float(np.polyfit(ts_norm, v_arr, 1)[0])
         delta   = np.clip(slope * 0.1, -latest * 0.1, latest * 0.1)
-        return float(np.clip(latest + delta, 0.0, 10.0))
+        return float(np.clip(latest + delta, 0.0, value_max))
 
     @staticmethod
     def _safe_max(values) -> Any:
@@ -7160,6 +7671,57 @@ class FieldMerger:
             except (TypeError, ValueError):
                 pass
         return total
+
+    @staticmethod
+    def _sum_additive_over_prior(values: List[Any], weights: List[float]) -> float:
+        """Accumulative sum that respects the graph-prior baseline.
+
+        The observation list is expected to start with a __graph_prior__ entry
+        that already holds the previously accumulated total (e.g. after three
+        earlier ingestion sessions the prior might be investment_total_usd=5M).
+
+        Naive _sum_unique([5M, 2M, 1M]) would produce 8M even though the 2M
+        and 1M rounds are already embedded in the 5M prior — double-counting.
+
+        This method:
+        1. Treats the *highest-trust* value (the prior, weight=1.0) as the base.
+        2. For each additional source, adds the amount only if it represents
+           genuinely new information: its value must exceed the current running
+           base by a meaningful delta (> 1% of base or absolute > 1).
+        3. Returns max(base, base + new_increments).
+
+        If there is no prior (base=0), it falls back to _sum_unique semantics.
+        """
+        numeric: List[tuple] = []  # (weight, value)
+        for v, w in zip(values, weights):
+            try:
+                fv = float(v)
+                fw = float(w)
+                if fv > 0:
+                    numeric.append((fw, fv))
+            except (TypeError, ValueError):
+                pass
+        if not numeric:
+            return 0.0
+
+        # Identify the prior: the entry with the highest trust weight.
+        # In practice this is the __graph_prior__ observation (trust=1.0).
+        numeric.sort(key=lambda x: x[0], reverse=True)
+        base = numeric[0][1]
+
+        # Accumulate only increments that cannot plausibly be subsets of the base.
+        incremental = base
+        for _, v in numeric[1:]:
+            # A new source value is "new" when it is larger than the current
+            # running total — it implies rounds/posts not yet captured.
+            if v > incremental * 1.01 + 1.0:
+                incremental = v  # absorb: new source supersedes old total
+            elif v > base * 0.1:
+                # Small increment heuristic: treat values that are < base as
+                # a partial view; add only the excess over the base they imply.
+                excess = max(0.0, v - base)
+                incremental += excess
+        return incremental
 
     @staticmethod
     def _union_list(values) -> List:
@@ -7228,6 +7790,12 @@ class NodeConsolidator:
         weights    = [o.trust for o in obs]
         timestamps = [o.timestamp for o in obs]
 
+        # Observations from the graph-prior are NOT real external sources.
+        # They must participate in field merging (as the accumulated knowledge
+        # baseline) but must NOT appear in provenance or be treated as independent
+        # sources for conflict detection.
+        real_obs = [o for o in obs if o.source != "__graph_prior__"]
+
         def merge(field_name: str, strategy: Optional[MergeStrategy] = None) -> Any:
             s = strategy or NODE_FIELD_STRATEGIES.get(
                 field_name, MergeStrategy.TRUST_WEIGHTED_MEAN)
@@ -7240,8 +7808,11 @@ class NodeConsolidator:
             full_text=merge("full_text", MergeStrategy.KEEP_FIRST),
             node_type=merge("node_type"), domain=merge("domain"),
             entity_type=merge("entity_type"),
-            provenance=", ".join(sorted({o.source for o in obs})),
-            timestamp=record.latest_timestamp,
+            # provenance only from real sources, not the internal prior
+            provenance=", ".join(sorted({o.source for o in real_obs})) if real_obs
+                       else ", ".join(sorted({o.source for o in obs})),
+            # timestamp: latest real-source observation; fall back to latest overall
+            timestamp=max((o.timestamp for o in real_obs), default=record.latest_timestamp),
             publication_date=merge("publication_date", MergeStrategy.TEMPORAL_LATEST),
             scientific_score=merge("scientific_score"),
             investment_score=merge("investment_score"),
@@ -7277,8 +7848,14 @@ class NodeConsolidator:
                 axis_weights = [o.trust for o in obs if axis in o.physical]
                 axis_ts      = [o.timestamp for o in obs if axis in o.physical]
                 if axis_values:
-                    merged_physical[axis] = float(
-                        FieldMerger.apply(strategy, axis_values, axis_weights, axis_ts) or 0.5)
+                    if strategy == MergeStrategy.TEMPORAL_TREND:
+                        # Physical axes are 0-1 scale — use tight clip
+                        merged_val = FieldMerger._temporal_trend(
+                            axis_values, axis_ts, value_max=1.0)
+                    else:
+                        merged_val = FieldMerger.apply(
+                            strategy, axis_values, axis_weights, axis_ts) or 0.5
+                    merged_physical[axis] = float(merged_val)
             node.__dict__["raw_physical_scores"] = merged_physical
 
             # Rebuild the physical section of the embedding using the real encoder so that
@@ -7315,22 +7892,67 @@ class NodeConsolidator:
     @staticmethod
     def _compute_conflicts(obs: List[Observation],
                             variance_threshold: float = None) -> Dict[str, Dict]:
-        threshold = variance_threshold or CONFIG.get(
+        """Detect fields where independent real sources disagree significantly.
+
+        Uses separate thresholds for:
+          - 0-10 score fields  (std > 2.0 ≈ 20% of range is conflicting)
+          - 0-1 physical axes  (std > 0.20 ≈ 20% of range is conflicting)
+
+        The __graph_prior__ observation is intentionally excluded from conflict
+        detection — it represents accumulated knowledge, not an independent source.
+        Comparing the prior against new data would generate spurious conflicts on
+        every re-ingestion cycle.
+        """
+        # Only count genuinely independent external sources
+        real_obs = [o for o in obs if o.source != "__graph_prior__"]
+        if len(real_obs) < 2:
+            return {}
+
+        score_threshold = variance_threshold or CONFIG.get(
             "consolidation_conflict_variance_threshold", 2.0)
-        conflicts = {}
+        physical_threshold = CONFIG.get(
+            "consolidation_physical_conflict_threshold", 0.20)
+
+        conflicts: Dict[str, Dict] = {}
+
+        # ── Standard node score fields ────────────────────────────────────────
         for fname in list(NODE_FIELD_STRATEGIES.keys()):
             vals, srcs = [], []
-            for o in obs:
+            for o in real_obs:
                 v = o.fields.get(fname)
                 try:
-                    vals.append(float(v)); srcs.append(o.source)
+                    fv = float(v)
+                    vals.append(fv); srcs.append(o.source)
                 except (TypeError, ValueError):
                     pass
             if len(vals) >= 2:
                 std = statistics.stdev(vals)
-                if std > threshold:
-                    conflicts[fname] = {"std": round(std, 3), "min": min(vals),
-                                        "max": max(vals), "values": vals, "sources": srcs}
+                if std > score_threshold:
+                    conflicts[fname] = {
+                        "std": round(std, 3), "min": min(vals),
+                        "max": max(vals), "values": vals, "sources": srcs,
+                        "scale": "0-10",
+                    }
+
+        # ── Physical substrate axes (0-1 scale, different threshold) ─────────
+        for axis in PHYSICAL_AXIS_ORDER:
+            vals, srcs = [], []
+            for o in real_obs:
+                v = o.physical.get(axis)
+                if v is not None:
+                    try:
+                        vals.append(float(v)); srcs.append(o.source)
+                    except (TypeError, ValueError):
+                        pass
+            if len(vals) >= 2:
+                std = statistics.stdev(vals)
+                if std > physical_threshold:
+                    conflicts[f"physical.{axis}"] = {
+                        "std": round(std, 3), "min": min(vals),
+                        "max": max(vals), "values": vals, "sources": srcs,
+                        "scale": "0-1",
+                    }
+
         return conflicts
 
 
@@ -7338,7 +7960,20 @@ class EdgeConsolidator:
     """
     Merges N observations of one edge into a single KnowledgeEdge.
     relationship_type is resolved by trust-weighted majority vote.
+
+    Edge component fields (semantic_similarity, inhibitory_force, etc.) use None
+    as the "not extracted" sentinel.  Storing 0.0 as default would include
+    unextracted components in TRUST_WEIGHTED_MEAN and silently underestimate
+    all edge weights.
     """
+
+    # Edge component fields that should be treated as "not extracted" when 0.0.
+    # These are all normalised to [0, 1] and default to 0.0 in KnowledgeEdge.
+    EDGE_SCORE_FIELDS = {
+        "semantic_similarity", "temporal_proximity", "limitation_resolution",
+        "citation_link", "investment_correlation", "social_correlation",
+        "inhibitory_force", "confidence",
+    }
 
     def consolidate(self, record: EdgeRecord) -> KnowledgeEdge:
         obs        = record.observations
@@ -7347,8 +7982,16 @@ class EdgeConsolidator:
 
         def merge(field_name: str) -> Any:
             s = EDGE_FIELD_STRATEGIES.get(field_name, MergeStrategy.TRUST_WEIGHTED_MEAN)
-            return FieldMerger.apply(s, [o.fields.get(field_name, 0.0) for o in obs],
-                                     weights, timestamps)
+            # Use None for "not extracted" component values (same as NodeConsolidator).
+            # FieldMerger._trust_weighted_mean / _safe_max skip None via float() exception.
+            raw_values = []
+            for o in obs:
+                v = o.fields.get(field_name)
+                if field_name in self.EDGE_SCORE_FIELDS and isinstance(v, float) and v == 0.0:
+                    raw_values.append(None)
+                else:
+                    raw_values.append(v if v is not None else o.fields.get(field_name, None))
+            return FieldMerger.apply(s, raw_values, weights, timestamps)
 
         rt_values  = [o.fields.get("relationship_type", "related") for o in obs]
         primary_rt = FieldMerger._majority_vote(rt_values, weights)
@@ -7368,11 +8011,63 @@ class EdgeConsolidator:
             timestamp=max(o.timestamp for o in obs),
         )
         edge.compute_total_weight()
+        # Exclude the graph-prior from the "sources" metadata — it's not an
+        # independent external source and shouldn't appear in lineage reports.
+        real_obs = [o for o in obs if o.source != "__graph_prior__"]
+        real_rt_values = [o.fields.get("relationship_type", "related") for o in real_obs]
         edge.__dict__["alternate_relationship_types"] = [
-            rt for rt in rt_values if rt != primary_rt]
+            rt for rt in real_rt_values if rt != primary_rt]
         edge.__dict__["consolidation_meta"] = {
-            "observation_count": len(obs), "sources": [o.source for o in obs]}
+            "observation_count": len(real_obs),
+            "sources": [o.source for o in real_obs],
+            "conflicts": self._compute_edge_conflicts(real_obs),
+        }
         return edge
+
+    @staticmethod
+    def _compute_edge_conflicts(real_obs: List[Observation]) -> Dict[str, Dict]:
+        """Detect edge component fields where real sources genuinely disagree.
+
+        0.0 values are treated as "not extracted by LLM" (same sentinel logic
+        used in EdgeConsolidator.merge and NodeConsolidator._node_to_fields).
+        Including 0.0 defaults would generate false conflicts whenever one
+        source doesn't mention a field and another source reports e.g. 0.9.
+        """
+        if len(real_obs) < 2:
+            return {}
+        threshold = CONFIG.get("consolidation_physical_conflict_threshold", 0.20)
+        # Fields where 0.0 means "not observed by this source" (all normalised
+        # edge score components).  Only non-zero values from ≥2 sources are
+        # considered for conflict detection.
+        SENTINEL_ZERO_FIELDS = {
+            "semantic_similarity", "temporal_proximity", "limitation_resolution",
+            "citation_link", "investment_correlation", "social_correlation",
+            "inhibitory_force", "confidence",
+        }
+        conflicts: Dict[str, Dict] = {}
+        for fname in EDGE_FIELD_STRATEGIES:
+            if fname == "relationship_type":
+                continue
+            vals, srcs = [], []
+            for o in real_obs:
+                v = o.fields.get(fname)
+                try:
+                    fv = float(v)
+                    # Skip 0.0 for score fields — indistinguishable from
+                    # "not extracted"; including them creates false conflicts.
+                    if fname in SENTINEL_ZERO_FIELDS and fv == 0.0:
+                        continue
+                    vals.append(fv); srcs.append(o.source)
+                except (TypeError, ValueError):
+                    pass
+            if len(vals) >= 2:
+                std = statistics.stdev(vals)
+                if std > threshold:
+                    conflicts[fname] = {
+                        "std": round(std, 3), "min": min(vals),
+                        "max": max(vals), "values": vals, "sources": srcs,
+                    }
+        return conflicts
 
 
 @dataclass
@@ -7414,6 +8109,19 @@ class GraphConsolidator:
                      trust: float = 0.7,
                      canonical_id: Optional[str] = None) -> str:
         cid = canonical_id or node.id
+        # Guard: a date_unknown observation must only enrich an existing node.
+        # If it arrives without a canonical_id mapping to a known graph node
+        # (i.e. no one confirmed it matches something already in the graph),
+        # reject it to prevent undated nodes from entering the knowledge base.
+        if node.__dict__.get("date_unknown") and canonical_id is None:
+            logger.warning(
+                f"[Consolidator] observe_node rejected '{node.id}' "
+                f"('{node.text[:60]}'): no date and no canonical_id — "
+                "cannot create a new dateless node. "
+                "Provide publication_year or route via load_result_into_graph "
+                "with a consolidator so the match resolves first."
+            )
+            return cid  # return without adding to records
         if cid not in self._node_records:
             self._node_records[cid] = NodeRecord(canonical_id=cid)
         physical = getattr(node, "__dict__", {}).get("raw_physical_scores", {})
@@ -7453,6 +8161,50 @@ class GraphConsolidator:
         stats = ConsolidationStats(
             nodes_before=len(graph.nodes),
             edges_before=len(graph.edges))
+
+        # ── Seed each NodeRecord with the current graph state as a prior ──────
+        # Without this, each apply_to_graph call only consolidates observations
+        # from the current session.  Existing accumulated data (from previous
+        # ingestion sessions, DormancyTracker updates, etc.) would be silently
+        # overwritten by a fresh partial extraction.
+        #
+        # IMPORTANT: we must never double-seed.  If apply_to_graph is called
+        # multiple times on the same consolidator, the prior from the previous
+        # call is already baked into the graph node.  We purge any leftover
+        # __graph_prior__ observations before re-seeding so the prior is always
+        # fresh and never accumulates N copies with weight N×1.0.
+        prior_trust = CONFIG.get("consolidation_graph_prior_trust", 1.0)
+        for cid, record in self._node_records.items():
+            # Strip any stale prior from a previous apply_to_graph call.
+            record.observations = [o for o in record.observations
+                                    if o.source != "__graph_prior__"]
+            existing = graph.get_node(cid)
+            if existing is not None:
+                prior_obs = Observation(
+                    source="__graph_prior__",
+                    timestamp=existing.timestamp,
+                    trust=prior_trust,
+                    physical=getattr(existing, "__dict__", {}).get("raw_physical_scores", {}),
+                    fields=self._node_to_fields(existing),
+                )
+                # Insert at position 0 so it acts as the baseline that new
+                # observations supplement, not override.
+                record.observations.insert(0, prior_obs)
+
+        # ── Also seed EdgeRecords with existing graph edges ───────────────────
+        for (src, tgt), record in self._edge_records.items():
+            record.observations = [o for o in record.observations
+                                    if o.source != "__graph_prior__"]
+            existing_edge = graph.get_edge(src, tgt)
+            if existing_edge is not None:
+                prior_obs = Observation(
+                    source="__graph_prior__",
+                    timestamp=existing_edge.timestamp,
+                    trust=prior_trust,
+                    fields=self._edge_to_fields(existing_edge),
+                )
+                record.observations.insert(0, prior_obs)
+
         # 1. Consolidate nodes
         consolidated_nodes = {}
         for cid, record in self._node_records.items():
@@ -7466,17 +8218,41 @@ class GraphConsolidator:
                 stats.conflicts_found += len(meta["conflicts"])
                 stats.high_conflict_nodes.append(cid)
             consolidated_nodes[cid] = node
-        # 2. Replace nodes in graph
+        # 2. Replace nodes in graph — use remove_node() to keep ALL indices clean
         for old_id in self._id_redirects:
-            graph.nodes.pop(old_id, None)
+            graph.remove_node(old_id) if hasattr(graph, "remove_node") else graph.nodes.pop(old_id, None)
         for cid, node in consolidated_nodes.items():
             graph.nodes[cid] = node
-        # 3. Redirect stale edge IDs
-        for edge in list((graph.edges.values()
-                          if isinstance(graph.edges, dict) else [])):
-            if hasattr(edge, "source_id"):
-                edge.source_id = self._id_redirects.get(edge.source_id, edge.source_id)
-                edge.target_id = self._id_redirects.get(edge.target_id, edge.target_id)
+        # 3. Redirect stale edge keys ATOMICALLY.
+        #    Mutating only edge.source_id / edge.target_id leaves the dict key
+        #    stale: graph.edges[(old_id, X)] points to an edge with source_id=new_id.
+        #    We must rebuild the entire dict so keys always match field values.
+        if self._id_redirects:
+            new_edge_dict: Dict = {}
+            for (src, tgt), edge in list(
+                    (graph.edges if isinstance(graph.edges, dict) else {}).items()):
+                new_src = self._id_redirects.get(src, src)
+                new_tgt = self._id_redirects.get(tgt, tgt)
+                if new_src == new_tgt:
+                    continue  # self-loop created by redirect — drop it
+                edge.source_id = new_src
+                edge.target_id = new_tgt
+                new_edge_dict[(new_src, new_tgt)] = edge
+            graph.edges = new_edge_dict
+            # Rebuild _incoming_ids from the remapped edges
+            if hasattr(graph, "_rebuild_incoming_cache"):
+                graph._rebuild_incoming_cache()
+            # Clean temporal_sorted and domain_clusters
+            redirected_away = set(self._id_redirects.keys())
+            graph.temporal_sorted = [
+                (ts, nid) for ts, nid in graph.temporal_sorted
+                if nid not in redirected_away
+            ]
+            for domain in list(graph.domain_clusters.keys()):
+                graph.domain_clusters[domain] = [
+                    nid for nid in graph.domain_clusters[domain]
+                    if nid not in redirected_away
+                ]
         # 4. Consolidate duplicate edges
         for key, record in self._edge_records.items():
             if len(record.observations) > 1:
@@ -7494,13 +8270,17 @@ class GraphConsolidator:
     def conflict_report(self, top_n: int = 20) -> List[Dict]:
         report = []
         for cid, record in self._node_records.items():
-            if len(record.observations) < 2:
+            # Only count truly independent external sources — exclude prior
+            real_obs = [o for o in record.observations
+                        if o.source != "__graph_prior__"]
+            if len(real_obs) < 2:
                 continue
+            # _compute_conflicts already filters __graph_prior__ internally
             conflicts = NodeConsolidator._compute_conflicts(record.observations)
             if conflicts:
                 report.append({
                     "node_id":         cid,
-                    "source_count":    record.source_count,
+                    "source_count":    len({o.source for o in real_obs}),
                     "conflict_fields": list(conflicts.keys()),
                     "worst_field":     max(conflicts, key=lambda k: conflicts[k]["std"]),
                     "worst_std":       max(c["std"] for c in conflicts.values()),
@@ -7515,13 +8295,33 @@ class GraphConsolidator:
             return []
         return [
             {"source": o.source, "timestamp": o.timestamp, "trust": o.trust,
+             # Include 0.0 values — they can be meaningful (e.g. zero inhibitory_force).
+             # Only skip None and empty strings.
              "fields": {k: v for k, v in o.fields.items()
-                        if isinstance(v, (int, float, str)) and v}}
+                        if v is not None and v != "" and isinstance(v, (int, float, str))},
+             "physical": dict(o.physical) if o.physical else {},
+            }
             for o in sorted(record.observations, key=lambda o: o.timestamp)
+            # Exclude the internal prior from the history — it's not a real source event
+            if o.source != "__graph_prior__"
         ]
 
     @staticmethod
     def _node_to_fields(node) -> Dict[str, Any]:
+        # Numeric score fields where 0.0 is the *default unset* value.
+        # When the LLM does not extract a score, the node field stays 0.0.
+        # Storing 0.0 as-is would include it in TRUST_WEIGHTED_MEAN and dilute
+        # existing non-zero observations.  We store None instead, which all
+        # FieldMerger strategies skip, preserving the "not observed" semantics.
+        NUMERIC_SCORE_FIELDS = {
+            "scientific_score", "investment_score", "social_score",
+            "maturity_score", "readiness_score", "group_size_score",
+            "dual_use_risk", "legal_risk_score", "export_control_risk",
+            "strategic_value", "efficiency_plateau",
+            "investment_last_round_usd",
+            "sentiment_review_score", "sentiment_fiction_score",
+            "sentiment_forum_score", "social_perception_score",
+        }
         scalar_fields = [
             "text", "full_text", "node_type", "domain", "entity_type",
             "publication_date", "scientific_score", "investment_score",
@@ -7534,7 +8334,15 @@ class GraphConsolidator:
         ]
         list_fields = ["investment_lead_investors", "solves_limitations",
                        "requires_node_ids", "enables_node_ids"]
-        d = {f: getattr(node, f, None) for f in scalar_fields}
+        d: Dict[str, Any] = {}
+        for f in scalar_fields:
+            v = getattr(node, f, None)
+            # Treat 0.0 on numeric score fields as "not extracted by LLM"
+            # (all score fields default to 0.0 in KnowledgeNode).
+            if f in NUMERIC_SCORE_FIELDS and isinstance(v, float) and v == 0.0:
+                d[f] = None
+            else:
+                d[f] = v
         for f in list_fields:
             v = getattr(node, f, None)
             d[f] = list(v) if v else []
@@ -7598,6 +8406,24 @@ class GraphConsolidator:
 
     @staticmethod
     def _replace_edges_in_graph(graph, src_id: str, tgt_id: str, cons_edge) -> None:
+        """Replace all edges (src_id→tgt_id) with the consolidated one.
+
+        Guards:
+        - Self-loops (created when src/tgt mapped to the same canonical id) are
+          dropped silently rather than inserted into the graph.
+        - _incoming_ids cache is rebuilt after deletion so AncestryEnforcer
+          remains consistent.
+        """
+        if src_id == tgt_id:
+            # Drop self-loop: delete any existing (src, tgt) entries and return
+            to_remove = [k for k, e in graph.edges.items()
+                         if getattr(e, "source_id", None) == src_id
+                         and getattr(e, "target_id", None) == tgt_id]
+            for key in to_remove:
+                del graph.edges[key]
+            if to_remove and hasattr(graph, "_rebuild_incoming_cache"):
+                graph._rebuild_incoming_cache()
+            return
         edges_dict = graph.edges if isinstance(graph.edges, dict) else {}
         to_remove  = [k for k, e in edges_dict.items()
                       if (getattr(e, "source_id", None) == src_id and
@@ -7605,9 +8431,9 @@ class GraphConsolidator:
         for key in to_remove:
             del graph.edges[key]
         if hasattr(graph, "add_edge"):
-            graph.add_edge(cons_edge)
+            graph.add_edge(cons_edge)   # add_edge updates _incoming_ids
         else:
-            graph.edges[cons_edge.id] = cons_edge
+            graph.edges[(cons_edge.source_id, cons_edge.target_id)] = cons_edge
 
 
 def print_conflict_report(consolidator: GraphConsolidator, top_n: int = 10) -> None:
