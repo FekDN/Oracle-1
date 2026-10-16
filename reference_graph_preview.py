@@ -7,7 +7,7 @@ References section. OpenAlex is used for bibliographic labels and publication
 years; it does not provide semantic/causal edge judgments here.
 
 Example:
-    python reference_graph_preview.py --corpus-dir 
+    python reference_graph_preview.py --corpus-dir "C://"
     python visualizer_server.py --snapshot artifacts/reference_preview/graph_snapshot.pkl --port 50510
 """
 
