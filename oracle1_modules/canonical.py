@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Contextual concept classification and canonical node assembly."""
 from __future__ import annotations
 
