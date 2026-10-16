@@ -1,0 +1,1713 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oracle-1 — Временной визуализатор графа</title>
+<style>
+  :root {
+    --bg:        #0a0e14;
+    --panel:     #10161f;
+    --panel-2:   #141b26;
+    --hairline:  #1e2733;
+    --text:      #e6edf3;
+    --text-dim:  #6b7785;
+    --text-mute: #46505c;
+
+    --confirmed: #5ec8d8;   /* real, multi-source node */
+    --central:   #f2b84e;   /* currently focused node */
+    --phantom:   #a78bfa;   /* structural-gap / cultural_phantom node */
+    --limit:     #e08585;   /* physical_limit node */
+    --zone-fill: rgba(242, 184, 78, 0.07);
+    --zone-line: rgba(242, 184, 78, 0.38);
+    --edge:      #3d4b5c;
+    --edge-hot:  #8fb4cf;
+
+    --font-ui:   -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: var(--font-ui);
+  }
+
+  body {
+    display: flex; flex-direction: column;
+    height: 100vh; overflow: hidden;
+  }
+
+  /* ── Top bar ─────────────────────────────────────────────────────── */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--hairline);
+    flex-shrink: 0;
+    min-width: 0;
+  }
+
+  .brand {
+    font-size: 13px; letter-spacing: 0.01em; color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .brand b { color: var(--text); font-weight: 600; }
+
+  .search-wrap { position: relative; flex: 1 1 100%; min-width: 0; max-width: none; }
+
+  #search {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--hairline);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    outline: none;
+  }
+  #search:focus { border-color: var(--confirmed); }
+
+  #suggestions {
+    position: absolute; top: 100%; left: 0; right: 0;
+    background: var(--panel-2);
+    border: 1px solid var(--hairline);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    max-height: 240px; overflow-y: auto;
+    z-index: 20;
+    display: none;
+  }
+  #suggestions.open { display: block; }
+  .suggestion {
+    padding: 8px 12px; font-size: 13px; cursor: pointer;
+    border-bottom: 1px solid var(--hairline);
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  .suggestion:last-child { border-bottom: none; }
+  .suggestion:hover, .suggestion.active { background: #1a2330; }
+  .suggestion .stype { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; }
+
+  .path-crumbs {
+    font-size: 12px; color: var(--text-dim); font-family: var(--font-mono);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .path-crumbs .sep { margin: 0 6px; color: var(--text-mute); }
+  .path-crumbs .crumb { cursor: pointer; color: var(--text-dim); }
+  .path-crumbs .crumb:hover { color: var(--confirmed); text-decoration: underline; }
+  .path-crumbs .crumb.current { color: var(--central); }
+
+  button.legend-toggle {
+    background: none; border: 1px solid var(--hairline); color: var(--text-dim);
+    font-family: var(--font-ui); font-size: 12px; padding: 7px 12px;
+    border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  button.legend-toggle:hover { border-color: var(--text-dim); color: var(--text); }
+
+  /* This page is also embedded in a dashboard card, so the useful width is
+     often only 500–700 px even on a desktop monitor. Keep search on its own
+     full-width row at that size instead of allowing flex-shrink to collapse it. */
+  @media (max-width: 900px) {
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px 10px;
+      padding: 10px 12px;
+    }
+    .brand, .search-wrap, #crumbs { grid-column: 1 / -1; min-width: 0; }
+    #server-url {
+      grid-column: 1;
+      width: 100% !important;
+      min-width: 0;
+    }
+    #connect-btn { grid-column: 2; }
+    .search-wrap { grid-row: 3; width: 100%; max-width: none; }
+    #search { min-width: 0; }
+    #load-status { grid-column: 1; min-width: 0; }
+    #legend-toggle { grid-column: 2; }
+  }
+
+  @media (max-width: 520px) {
+    header { grid-template-columns: minmax(0, 1fr); }
+    .brand, #server-url, #connect-btn, .search-wrap, #crumbs,
+    #load-status, #legend-toggle { grid-column: 1; }
+    #connect-btn, #legend-toggle { justify-self: start; }
+    .search-wrap { grid-row: auto; }
+    #time-controls { gap: 4px; margin-left: 8px; max-width: calc(100% - 16px); }
+    #time-pan { width: 74px; }
+  }
+
+  /* ── Main layout ─────────────────────────────────────────────────── */
+  main {
+    flex: 1; display: flex; overflow: hidden; min-height: 0;
+  }
+
+  #graph-scroll {
+    flex: 1; overflow: auto; position: relative;
+  }
+  #graph-svg { display: block; }
+
+  #time-controls {
+    position: sticky; top: 10px; z-index: 12;
+    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+    width: fit-content; max-width: calc(100% - 24px);
+    margin: 10px 0 -40px 12px; padding: 6px 8px;
+    color: var(--text-dim); background: rgba(16, 22, 31, 0.96);
+    border: 1px solid var(--hairline); border-radius: 7px;
+    font-size: 11px; line-height: 1.2;
+  }
+  #time-controls button {
+    min-width: 27px; height: 26px; padding: 0 7px;
+    background: var(--panel-2); border: 1px solid var(--hairline);
+    border-radius: 4px; color: var(--text); cursor: pointer;
+  }
+  #time-controls button:hover:not(:disabled) { border-color: var(--central); color: var(--central); }
+  #time-controls button:disabled { opacity: .4; cursor: default; }
+  #time-controls .time-title { color: var(--text); white-space: nowrap; }
+  #time-range { min-width: 82px; text-align: center; font-family: var(--font-mono); white-space: nowrap; }
+  #time-pan { width: clamp(70px, 12vw, 150px); margin: 0 2px; accent-color: var(--central); }
+
+  /* ── Legend ──────────────────────────────────────────────────────── */
+  #legend {
+    position: absolute; top: 14px; right: 14px;
+    background: rgba(16, 22, 31, 0.94);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 12px; color: var(--text-dim);
+    line-height: 1.9;
+    z-index: 10;
+    display: none;
+    min-width: 240px;
+  }
+  #legend.open { display: block; }
+  #legend h4 { margin: 0 0 8px; font-size: 11px; color: var(--text-mute); font-weight: 600; }
+  #legend .row { display: flex; align-items: center; gap: 9px; }
+  #legend .swatch { width: 22px; height: 3px; flex-shrink: 0; }
+  #legend .dotswatch { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin: 0 7px; }
+
+  /* ── Side data panel ─────────────────────────────────────────────── */
+  #panel {
+    width: 0; flex-shrink: 0; overflow: hidden;
+    border-left: 1px solid var(--hairline);
+    background: var(--panel);
+    transition: width 0.16s ease;
+  }
+  #panel.open { width: 380px; }
+  #panel-inner { width: 380px; height: 100%; overflow-y: auto; padding: 18px 20px; }
+
+  #panel .kind {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-mute); margin-bottom: 6px;
+  }
+  #panel h2 {
+    font-size: 16px; margin: 0 0 4px; line-height: 1.35; font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  #panel .sub { font-size: 12px; color: var(--text-dim); margin-bottom: 18px; overflow-wrap: anywhere; }
+
+  #panel .close-btn {
+    float: right; background: none; border: none; color: var(--text-dim);
+    font-size: 18px; cursor: pointer; line-height: 1;
+  }
+  #panel .close-btn:hover { color: var(--text); }
+
+  .field {
+    display: flex; justify-content: space-between; gap: 12px;
+    padding: 7px 0; border-bottom: 1px solid var(--hairline);
+    font-size: 13px;
+  }
+  .field .k { color: var(--text-dim); }
+  .field .v { font-family: var(--font-mono); font-size: 12.5px; text-align: right; word-break: break-word; }
+
+  .snippet {
+    margin-top: 14px; padding: 12px; background: var(--panel-2);
+    border-radius: 6px; font-size: 13px; line-height: 1.55; color: var(--text);
+    border-left: 2px solid var(--confirmed);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .source-card {
+    margin: 12px 0 16px; padding: 12px; background: var(--panel-2);
+    border: 1px solid var(--hairline); border-radius: 6px; overflow-wrap: anywhere;
+  }
+  .source-card .source-title { font-size: 13px; font-weight: 600; line-height: 1.45; }
+  .source-card .source-detail { margin-top: 4px; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+  .source-card a { color: var(--confirmed); overflow-wrap: anywhere; }
+  .badge {
+    display: inline-block; font-size: 10.5px; padding: 2px 7px; border-radius: 3px;
+    font-family: var(--font-mono); margin-right: 6px;
+  }
+  .badge.phantom { background: rgba(167,139,250,0.15); color: var(--phantom); }
+  .badge.limit { background: rgba(224,133,133,0.15); color: var(--limit); }
+  .badge.confirmed { background: rgba(94,200,216,0.15); color: var(--confirmed); }
+  .badge.disputed { background: rgba(246,190,93,0.15); color: #f6be5d; }
+
+  .hint { color: var(--text-mute); font-size: 12px; padding: 40px 20px; text-align: center; line-height: 1.6; }
+
+  /* focus visibility for keyboard users */
+  :focus-visible { outline: 2px solid var(--confirmed); outline-offset: 2px; }
+
+  svg .clickable { cursor: pointer; }
+  .edge-link, .edge-time-track { transition: stroke .12s ease, stroke-width .12s ease, opacity .12s ease, filter .12s ease; }
+  .edge-group:hover .edge-link, .edge-group.is-hovered .edge-link,
+  .edge-group:focus-visible .edge-link {
+    stroke: var(--central); stroke-width: 4; opacity: 1;
+    filter: drop-shadow(0 0 3px var(--central));
+  }
+  .edge-group:hover .edge-time-track, .edge-group.is-hovered .edge-time-track,
+  .edge-group:focus-visible .edge-time-track { stroke: var(--central); opacity: .95; }
+  svg text { font-family: var(--font-ui); user-select: none; }
+  svg .mono { font-family: var(--font-mono); }
+</style>
+<style>
+:root { --virtual: #b8d978; }
+.badge.virtual { background: rgba(184,217,120,0.15); color: var(--virtual); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">ORACLE-1 <b>·</b> временной граф</div>
+  <input id="server-url" type="text" value="http://127.0.0.1:8765"
+         title="Адрес serve_visualizer_api() — GET /neighborhood?id=..., /search?q=..."
+         style="width:190px;background:var(--panel-2);border:1px solid var(--hairline);color:var(--text-dim);font-family:var(--font-mono);font-size:12px;padding:7px 10px;border-radius:6px;">
+  <button class="legend-toggle" id="connect-btn" title="Подключиться к живому графу — экспорт в файл не масштабируется, запросы идут напрямую к RuntimeGraph через get_node_window()">подключиться</button>
+  <div class="search-wrap">
+    <input id="search" type="text" placeholder="Поиск узла — переход в его окно…" autocomplete="off">
+    <div id="suggestions"></div>
+  </div>
+  <div class="path-crumbs" id="crumbs"></div>
+  <span id="load-status" class="path-crumbs"></span>
+  <button class="legend-toggle" id="legend-toggle">легенда</button>
+</header>
+
+<main>
+  <div id="graph-scroll">
+    <div id="time-controls" aria-label="Масштаб временной шкалы">
+      <span class="time-title">Время</span>
+      <button id="time-zoom-out" type="button" title="Показать больший период" aria-label="Уменьшить масштаб">−</button>
+      <button id="time-zoom-in" type="button" title="Увеличить масштаб" aria-label="Увеличить масштаб">+</button>
+      <button id="time-pan-left" type="button" title="Перейти к более раннему периоду" aria-label="Раньше">←</button>
+      <input id="time-pan" type="range" min="0" max="1000" value="0" disabled
+             title="Перемещение по временному периоду" aria-label="Перемещение по временному периоду">
+      <button id="time-pan-right" type="button" title="Перейти к более позднему периоду" aria-label="Позже">→</button>
+      <button id="time-fit" type="button" title="Показать весь период текущего окна" aria-label="Весь период окна">весь период</button>
+      <span id="time-range">—</span>
+    </div>
+    <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="empty-state" class="hint" style="display:none">
+      Найдите узел через поиск вверху, чтобы открыть окно вокруг него.
+    </div>
+    <div id="legend">
+      <h4>Как читать</h4>
+      <div class="row"><span class="swatch" style="background:var(--central)"></span> текущий (центральный) узел</div>
+      <div class="row"><span class="swatch" style="background:var(--confirmed)"></span> подтверждённый узел</div>
+      <div class="row"><span class="swatch" style="background:var(--limit)"></span> physical_limit</div>
+      <div class="row"><span class="swatch" style="background:var(--phantom);border-top:2px dashed var(--phantom);height:0"></span> фантомный / неподтверждённый</div>
+      <div class="row"><span class="dotswatch" style="background:var(--virtual)"></span> виртуальный прогноз из реструктуризации</div>
+      <div class="row"><span class="dotswatch" style="background:var(--text-dim)"></span> метка узла = записи узла за один год</div>
+        <div class="row">цвет и толщина участка линии = статус и поддержка метки</div>
+        <div class="row"><span class="swatch" style="background:var(--text-dim)"></span> идея / концепт</div>
+        <div class="row"><span class="swatch" style="background:var(--virtual)"></span> теория</div>
+        <div class="row"><span class="swatch" style="background:var(--edge-hot)"></span> доказательство</div>
+        <div class="row"><span class="swatch" style="background:var(--confirmed)"></span> факт</div>
+        <div class="row"><span class="swatch" style="background:var(--limit)"></span> опровержение</div>
+      <div class="row"><span class="dotswatch" style="background:var(--edge-hot)"></span> точки на связи = датированные записи источников</div>
+      <div class="row">толщина линии = «плотность» (число источников)</div>
+      <div class="row">утолщения на линии = отдельные наблюдения — клик открывает их</div>
+      <div class="row"><span class="swatch" style="background:var(--zone-line)"></span> временная зона ускорения</div>
+      <h4 style="margin-top:12px">Рёбра</h4>
+      <div class="row"><span class="swatch" style="background:var(--limit)"></span> contradicts = опровержение сохранённой метки</div>
+      <div class="row">положение связи задаёт дата первого датированного наблюдения</div>
+      <div class="row">пунктир = интервал от ранней записи узлов до первого наблюдения ребра</div>
+      <div class="row">сплошной участок = диапазон датированных наблюдений связи</div>
+    </div>
+  </div>
+
+  <div id="panel">
+    <div id="panel-inner">
+      <div class="hint">Кликните по узлу, ребру, утолщению на линии или временной зоне,<br>чтобы увидеть данные.<br><br>Клик по соседнему узлу делает его центральным.</div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* ════════════════════════════════════════════════════════════════════
+   DATA CONTRACT
+   DEMO_NODES/DEMO_EDGES/DEMO_ZONES below are the offline fallback shown
+   before connecting. Real data never arrives as a bulk export — Oracle-1's
+   real scale (hundreds of billions of nodes) doesn't fit in a file or
+   browser memory, so it isn't asked for: "подключиться" instead points
+   this page at serve_visualizer_api() (oracle1.py), and every subsequent
+   node this page ever holds arrives one small window at a time —
+   GET /neighborhood?id=<id> for exactly one node's own 1-hop
+   neighbourhood (get_node_window(), O(degree(id))) and GET /search?q=...
+   for the search box. loadGraphData() is the single place a fetched
+   window (or the demo set) replaces NODES/EDGES/ZONES; nothing else
+   mutates them directly. The JSON shape below is exactly what both the
+   demo data and every /neighborhood response share, close to
+   KnowledgeNode / KnowledgeEdge / PhantomNode / TemporalZone in
+   oracle1.py by design — get_node_window() is a thin field mapping, not
+   a restructuring.
+
+   NODE:
+     id, text, domain, entity_type, origin_kind,
+     isPhantom          — true для PhantomNode (структурный разрыв,
+                           is_confirmed=false), а не для cultural_phantom
+                           (это обычный KnowledgeNode с entity_type
+                           "cultural_phantom" — сравните coherence_material
+                           и cultural_buzz ниже)
+     maturity_score, epistemic_level,
+     observations: [{ year, source, trust, snippet }]
+                        — если ровно одно наблюдение → узел рисуется
+                          точкой (идея ещё не сошлась/нет других
+                          источников), иначе линией от первого до
+                          последнего наблюдения
+     gap_description, structural_gap_score, void_pressure
+                        — только для isPhantom==true
+
+   EDGE:
+     id, source, target, relationship_type,
+     confidence, semantic_similarity, temporal_proximity, limitation_resolution,
+     inhibitory_force, citation_link, investment_correlation, social_correlation
+                        — final consolidated scores (EdgeConsolidator.consolidate)
+     observations: [{ year, source, trust, relationship_type, signal_type,
+                      factor_evidence, evidence }]
+                        — mirrors EdgeRecord.observations. The edge's
+                          "confirmed" span runs from min(year) to max(year)
+                          — max() is what EdgeConsolidator actually stores
+                          as KnowledgeEdge.timestamp (the LATEST
+                          reconfirmation, not first evidence: see
+                          consolidate(), timestamp=max(o.timestamp...)).
+                          A faint dashed lead-in runs from the later of the
+                          endpoints' earliest observations to the first
+                          recorded edge observation. This is only a gap in
+                          the currently loaded corpus, not a claim about when
+                          the relationship existed or was discovered.
+     isContested       — sources recorded different relationship types; the
+                          displayed type is still the trust-weighted winner.
+     isPhantom          — rêbra to an unconfirmed predicted bridge
+     Ровно одно ребро на упорядоченную пару (source,target) — в графе
+     RuntimeGraph.edges это гарантирует ключ (source_id,target_id) и
+     _replace_edges_in_graph (полная замена, не накопление).
+   ════════════════════════════════════════════════════════════════════ */
+
+const DEMO_NODES = {
+  classical_nn: {
+    id: "classical_nn", text: "Классические глубокие нейросети",
+    domain: "machine_learning", entity_type: "research_frontier",
+    origin_kind: "combinatorial", isPhantom: false,
+    maturity_score: 9.5, epistemic_level: "PROVEN_DISCOVERY",
+    observations: [
+      { year: 1986, source: "Rumelhart et al., Nature", trust: 0.95, snippet: "Backpropagation formalised as a general training method for layered networks." },
+      { year: 2012, source: "Krizhevsky et al., NeurIPS", trust: 0.97, snippet: "AlexNet demonstrates large-scale practical viability on ImageNet." },
+      { year: 2017, source: "Vaswani et al., NeurIPS", trust: 0.97, snippet: "Attention-based architecture displaces recurrent approaches." },
+      { year: 2022, source: "industry deployment reports", trust: 0.9, snippet: "Ubiquitous production deployment across consumer and enterprise systems." },
+    ],
+  },
+  quantum_chip: {
+    id: "quantum_chip", text: "Нейросетевой чип на квантовых эффектах",
+    domain: "quantum_computing", entity_type: "research_frontier",
+    origin_kind: "combinatorial", isPhantom: false,
+    maturity_score: 2.5, epistemic_level: "PEER_REVIEWED",
+    observations: [
+      { year: 2019, source: "arXiv:1902.xxxxx", trust: 0.55, snippet: "Speculative proposal for a quantum-effect-based neural substrate." },
+      { year: 2021, source: "форум r/QuantumComputing", trust: 0.25, snippet: "Обсуждение принципиальной реализуемости среди энтузиастов." },
+      { year: 2023, source: "Nature Electronics", trust: 0.85, snippet: "Первое рецензируемое исследование по осуществимости архитектуры." },
+      { year: 2025, source: "заявка на патент US2025/xxxxxx", trust: 0.5, snippet: "Патентная заявка на гибридную классически-квантовую архитектуру." },
+    ],
+  },
+  qubit_fab: {
+    id: "qubit_fab", text: "Отказоустойчивое производство кубитов",
+    domain: "quantum_computing", entity_type: "research_frontier",
+    origin_kind: "combinatorial", isPhantom: false,
+    maturity_score: 4.0, epistemic_level: "PEER_REVIEWED",
+    observations: [
+      { year: 2015, source: "Physical Review X", trust: 0.8, snippet: "Первые устойчивые схемы коррекции ошибок в малых массивах кубитов." },
+      { year: 2019, source: "IBM Research отчёт", trust: 0.75, snippet: "Демонстрация масштабирования до 50+ физических кубитов." },
+      { year: 2023, source: "Nature", trust: 0.9, snippet: "Прототип с логическим кубитом ниже порога коррекции ошибок." },
+    ],
+  },
+  coherence_limit: {
+    id: "coherence_limit", text: "Предел декогеренции при комнатной температуре",
+    domain: "quantum_computing", entity_type: "physical_limit",
+    origin_kind: "fundamental", isPhantom: false,
+    maturity_score: 1.0, epistemic_level: "PROVEN_DISCOVERY",
+    observations: [
+      { year: 2008, source: "Physical Review Letters", trust: 0.9, snippet: "Экспериментально измерено время декогеренции для базовых кубитных систем." },
+      { year: 2016, source: "Reviews of Modern Physics", trust: 0.95, snippet: "Обзор фундаментальных термодинамических границ." },
+      { year: 2024, source: "arXiv:2401.xxxxx", trust: 0.7, snippet: "Уточнение границ для новых материальных платформ." },
+    ],
+  },
+  coherence_material: {
+    id: "coherence_material", text: "Материал с когерентностью при комнатной температуре",
+    domain: "quantum_computing", entity_type: "research_frontier",
+    origin_kind: "fundamental", isPhantom: true,
+    structural_gap_score: 0.81, void_pressure: 0.64,
+    gap_description: "Структурный кандидат между пределом декогеренции и квантовым чипом.",
+    observations: [],
+  },
+  cultural_buzz: {
+    id: "cultural_buzz", text: "Хайп вокруг «квантового ИИ»",
+    domain: "culture", entity_type: "cultural_phantom",
+    origin_kind: "combinatorial", isPhantom: false,
+    maturity_score: 0.5, epistemic_level: "FOLKLORE_FICTION",
+    observations: [
+      { year: 2023, source: "обсуждение в Twitter/X", trust: 0.15, snippet: "Вирусный тред с громкими, не подкреплёнными данными заявлениями о «квантовом ИИ»." },
+    ],
+  },
+};
+
+const DEMO_EDGES = [
+  { id: "e1", source: "classical_nn", target: "quantum_chip", relationship_type: "precedes",
+    confidence: 0.55, semantic_similarity: 0.62, temporal_proximity: 0.4,
+    limitation_resolution: 0, inhibitory_force: 0, citation_link: 0.3, investment_correlation: 0.2,
+    social_correlation: 0.1, isPhantom: false,
+    observations: [
+      { year: 2019, source: "arXiv:1902.xxxxx", trust: 0.55 },
+    ] },
+  { id: "e2", source: "quantum_chip", target: "qubit_fab", relationship_type: "requires",
+    confidence: 0.78, semantic_similarity: 0.7, temporal_proximity: 0.6,
+    limitation_resolution: 0.1, inhibitory_force: 0.2, citation_link: 0.4, investment_correlation: 0.5,
+    social_correlation: 0.2, isPhantom: false,
+    observations: [
+      { year: 2021, source: "форум r/QuantumComputing", trust: 0.3 },
+      { year: 2023, source: "Nature Electronics", trust: 0.85 },
+    ] },
+  { id: "e3", source: "qubit_fab", target: "coherence_limit", relationship_type: "requires",
+    confidence: 0.82, semantic_similarity: 0.66, temporal_proximity: 0.5,
+    limitation_resolution: 0.15, inhibitory_force: 0.55, citation_link: 0.5, investment_correlation: 0.3,
+    social_correlation: 0.05, isPhantom: false,
+    observations: [
+      { year: 2019, source: "IBM Research отчёт", trust: 0.75 },
+      { year: 2023, source: "Nature", trust: 0.9 },
+    ] },
+  { id: "e4", source: "quantum_chip", target: "coherence_limit", relationship_type: "requires",
+    confidence: 0.7, semantic_similarity: 0.6, temporal_proximity: 0.55,
+    limitation_resolution: 0.1, inhibitory_force: 0.7, citation_link: 0.35, investment_correlation: 0.25,
+    social_correlation: 0.1, isPhantom: false,
+    observations: [
+      { year: 2023, source: "Nature Electronics", trust: 0.8 },
+    ] },
+  { id: "e5", source: "quantum_chip", target: "coherence_material", relationship_type: "candidate_bridge",
+    confidence: null, semantic_similarity: null, temporal_proximity: null,
+    limitation_resolution: null, inhibitory_force: null, citation_link: null, investment_correlation: null,
+    social_correlation: null, isPhantom: true, prediction_basis: [], observations: [] },
+  { id: "e6", source: "coherence_limit", target: "coherence_material", relationship_type: "candidate_bridge",
+    confidence: null, semantic_similarity: null, temporal_proximity: null,
+    limitation_resolution: null, inhibitory_force: null, citation_link: null, investment_correlation: null,
+    social_correlation: null, isPhantom: true, prediction_basis: [], observations: [] },
+  { id: "e7", source: "quantum_chip", target: "cultural_buzz", relationship_type: "related",
+    confidence: 0.2, semantic_similarity: 0.4, temporal_proximity: 0.9,
+    limitation_resolution: 0, inhibitory_force: 0, citation_link: 0, investment_correlation: 0.1,
+    social_correlation: 0.6, isPhantom: false,
+    observations: [
+      { year: 2023, source: "обсуждение в Twitter/X", trust: 0.15 },
+    ] },
+];
+
+const DEMO_ZONES = [
+  { id: "z1", description: "Конвергенция железа для ИИ", domain_focus: "quantum_computing",
+    start_year: 2023, end_year: 2025, zone_multiplier: 2.3,
+    contained_node_ids: ["quantum_chip", "qubit_fab"] },
+];
+
+/* ════════════════════════════════════════════════════════════════════
+   LIVE DATA — reassigned by loadGraphData() when a real export is loaded.
+   Exposed on window for external tooling/tests, kept in sync on every
+   (re)load rather than only once at start-up.
+   ════════════════════════════════════════════════════════════════════ */
+
+let NODES = {}, EDGES = [], ZONES = [];
+const NODE_TEXT_CACHE = new Map();
+
+// Invariant enforced upstream by RuntimeGraph (edges keyed by (source_id,
+// target_id) — _replace_edges_in_graph deletes any prior edge for a pair
+// before inserting the consolidated one): at most one edge per ordered
+// node pair. Returns the list of duplicate pair keys found (empty = clean)
+// rather than just logging, so a real-data load can surface this in the UI
+// instead of only the console.
+function findDuplicateEdgePairs(edges) {
+  const seen = new Set(), dups = [];
+  edges.forEach(e => {
+    const key = e.source + "\u2192" + e.target;
+    if (seen.has(key)) dups.push(key);
+    seen.add(key);
+  });
+  return dups;
+}
+
+// Swaps in a new graph — either the bundled demo set or a real export
+// loaded from disk (see the file-input handler below). Drops edges that
+// reference an id not present in `nodes` and any pair-duplicate beyond
+// the first (both defensively — Oracle-1's own invariants should already
+// guarantee neither happens, but a hand-edited or partial export is easy
+// to produce by accident) and reports what it dropped rather than
+// silently reshaping the data.
+function loadGraphData(data, opts) {
+  opts = opts || {};
+  const nodes = data.nodes || {};
+  Object.entries(nodes).forEach(([id, node]) => {
+    if (node && typeof node.text === "string") NODE_TEXT_CACHE.set(id, node.text);
+  });
+  const nodeIds = new Set(Object.keys(nodes));
+  const rawEdges = data.edges || [];
+
+  const orphanEdges = rawEdges.filter(e => !nodeIds.has(e.source) || !nodeIds.has(e.target));
+  const linkedEdges = rawEdges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+  const dupPairs = findDuplicateEdgePairs(linkedEdges);
+  const seenPairs = new Set();
+  const finalEdges = linkedEdges.filter(e => {
+    const key = e.source + "\u2192" + e.target;
+    if (seenPairs.has(key)) return false;
+    seenPairs.add(key);
+    return true;
+  });
+
+  NODES = nodes; EDGES = finalEdges; ZONES = data.zones || [];
+  window.NODES = NODES; window.EDGES = EDGES; window.ZONES = ZONES;
+
+  if (orphanEdges.length) {
+    console.warn(`loadGraphData: dropped ${orphanEdges.length} edge(s) referencing an unknown node id`, orphanEdges);
+  }
+  if (dupPairs.length) {
+    console.error(`loadGraphData: duplicate edge(s) for pair(s) ${dupPairs.join(", ")} — Oracle-1 allows only one edge per ordered node pair (see _replace_edges_in_graph); kept the first of each, dropped the rest.`);
+  }
+
+  const nextCentralId = opts.centralId && NODES[opts.centralId] ? opts.centralId : null;
+  if (nextCentralId !== state.centralId) state.timeWindow = null;
+  if (nextCentralId) {
+    state.centralId = nextCentralId;
+    if (opts.appendHistory && state.history.length) {
+      if (state.history[state.history.length - 1] !== nextCentralId) {
+        state.history.push(nextCentralId);
+      }
+    } else {
+      state.history = [nextCentralId];
+    }
+  } else {
+    state.centralId = null;
+    state.history = [];
+  }
+  if (state.history.length > 4) state.history = state.history.slice(-4);
+  const retainedLabels = new Set([...state.history, ...Object.keys(NODES)]);
+  for (const id of NODE_TEXT_CACHE.keys()) {
+    if (!retainedLabels.has(id)) NODE_TEXT_CACHE.delete(id);
+  }
+  closePanel();
+  render();
+  return {
+    nodeCount: Object.keys(NODES).length, edgeCount: EDGES.length,
+    droppedOrphanEdges: orphanEdges.length, droppedDuplicateEdges: dupPairs.length,
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   STATE
+   ════════════════════════════════════════════════════════════════════ */
+
+const state = {
+  centralId: null,
+  history: [],
+  selected: null,   // { kind: 'node'|'edge'|'observation'|'zone', data, extra }
+  liveMode: false,  // false: bundled demo dataset, local lookups.
+                     // true: every recenter/search is a fetch() against
+                     // serve_visualizer_api() — real Oracle-1 scale means
+                     // NODES/EDGES only ever hold the current small
+                     // window, never the whole graph (see get_node_window()
+                     // on the Python side for why an export was never the
+                     // right shape here).
+  serverUrl: "",
+  timeWindow: null, // { min, max } while zoomed; null fits the current neighborhood.
+};
+window.state = state;
+
+const NOW_YEAR = 2026;
+const svg = document.getElementById("graph-svg");
+const SVG_NS = "http://www.w3.org/2000/svg";
+let fittedTimeDomain = null;
+let renderedTimeDomain = null;
+
+function el(tag, attrs, children) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const k in (attrs || {})) e.setAttribute(k, attrs[k]);
+  (children || []).forEach(c => e.appendChild(c));
+  return e;
+}
+
+function nodeColor(node) {
+  if (node.isPhantom) return "var(--phantom)";
+  if (node.isVirtual) return "var(--virtual)";
+  if (node.entity_type === "physical_limit") return "var(--limit)";
+  return "var(--confirmed)";
+}
+
+function labelStatusColor(status) {
+  switch (status) {
+    case "idea_concept": return "var(--text-dim)";
+    case "theory": return "var(--virtual)";
+    case "proof": return "var(--edge-hot)";
+    case "evidence": return "var(--edge-hot)";
+    case "fact": return "var(--confirmed)";
+    case "refutation": return "var(--limit)";
+    default: return null;
+  }
+}
+
+function nodeSpan(node) {
+  if (node.isPhantom && Array.isArray(node.predicted_year_range)
+      && node.predicted_year_range.length === 2) {
+    const start = Number(node.predicted_year_range[0]);
+    const end = Number(node.predicted_year_range[1]);
+    if (Number.isFinite(start) && Number.isFinite(end)) return { start, end };
+  }
+  const years = node.observations
+    .map(o => o.year === null || o.year === undefined || o.year === "" ? NaN : Number(o.year))
+    .filter(Number.isFinite);
+  if (!years.length) return { start: NOW_YEAR, end: NOW_YEAR };
+  return { start: Math.min(...years), end: Math.max(...years) };
+}
+
+function edgeSpan(edge) {
+  const years = edge.observations
+    .map(o => o.year === null || o.year === undefined || o.year === "" ? NaN : Number(o.year))
+    .filter(Number.isFinite);
+  if (!years.length) return { firstConfirmed: null, lastConfirmed: null };
+  return { firstConfirmed: Math.min(...years), lastConfirmed: Math.max(...years) };
+}
+
+// An undated edge still needs a path between its endpoint lanes. Use the
+// midpoint of the endpoint spans for that path only; it is not an observation
+// date and is never exposed as edge evidence in the detail panel.
+function edgeLayoutYear(edge) {
+  const source = nodeSpan(NODES[edge.source]);
+  const target = nodeSpan(NODES[edge.target]);
+  return (source.start + source.end + target.start + target.end) / 4;
+}
+
+// Attach an edge to the actual temporal geometry of each endpoint. A point
+// node has no span to clamp within, so it always anchors at its marker year;
+// an interval node anchors at the confirmation year when that year lies on
+// its line, otherwise at the nearest end of the line.
+function nodeAnchorX(nodeId, year, xScale) {
+  const { start, end } = nodeSpan(NODES[nodeId]);
+  const anchorYear = Math.max(start, Math.min(end, Number.isFinite(year) ? year : start));
+  return xScale(anchorYear);
+}
+
+// This is a corpus-coverage boundary, not an ontological start date: nodeSpan
+// is built from the earliest observations currently loaded for each endpoint.
+// The dashed interval means only that the corpus has node records but no
+// recorded edge confirmation yet. A newly loaded earlier source can move this
+// boundary; it cannot prove when the relationship first existed.
+function retroStart(edge) {
+  return Math.max(nodeSpan(NODES[edge.source]).start, nodeSpan(NODES[edge.target]).start);
+}
+
+// Smooth spline through an ordered list of [x,y] points (Catmull-Rom,
+// converted to a chain of cubic Béziers) — unlike "straight line, then
+// sharp Q bump at the obstacle", curvature is present along the WHOLE
+// path, including the very first inch leaving the node, because the
+// node's own point is itself one of the interpolated points, not just a
+// straight segment's endpoint.
+function catmullRomPath(points) {
+  if (points.length < 2) return "";
+  const pts = [points[0], ...points, points[points.length - 1]];
+  let d = `M ${points[0][0]} ${points[0][1]}`;
+  for (let i = 1; i < pts.length - 2; i++) {
+    const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2];
+    const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += ` C ${c1x} ${c1y}, ${c2x} ${c2y}, ${p2[0]} ${p2[1]}`;
+  }
+  return d;
+}
+
+// Waypoints for one edge's link, kept separate from the path string so
+// the routing decision itself (where does it bulge, and how far) is
+// directly testable without parsing SVG path syntax. The link passes
+// through the first dated-observation marker on a half-lane temporal track;
+// intermediate node lanes are detoured around before reaching the endpoint.
+//
+// Straight vertical links that skip past an intermediate lane read as if
+// they touch/branch from it, even though that lane isn't part of this
+// edge at all — it just happens to sit between the central lane and the
+// far endpoint. Route around each intermediate lane's Y with a leftward
+// bulge instead of crossing it head-on, the same way a transit map curves
+// a line around a station it doesn't stop at. Even with NO intermediate
+// lane, a single soft midpoint waypoint is still included — the request
+// was specifically for the curve to begin right at the node rather than
+// running straight before it bends, and a 2-point Catmull-Rom segment
+// degenerates back to a straight line, so the direct case needs its own
+// (smaller) waypoint too, not just the obstacle case.
+function edgeWaypoints(x1, y1, x2, y2, confirmationX,
+                       offsetA, offsetB, laneHeight, centerY) {
+  const laneDirection = Math.sign(offsetB - offsetA) || (y2 > y1 ? -1 : 1);
+  const trackLane = offsetA + laneDirection * 0.5;
+  const trackY = centerY - trackLane * laneHeight;
+  const routeX = Math.min(x1, x2, confirmationX) - 15;
+  const points = [[x1, y1], [confirmationX, trackY]];
+
+  // The track lies halfway between the central lane and its nearest
+  // neighbor, so it cannot overlap any node row. Detour around any later
+  // integer lane between that track and the far endpoint.
+  for (let offset = offsetA + laneDirection;
+       laneDirection > 0 ? offset < offsetB : offset > offsetB;
+       offset += laneDirection) {
+    if (offset > trackLane && laneDirection > 0 || offset < trackLane && laneDirection < 0) {
+      points.push([routeX, centerY - offset * laneHeight]);
+    }
+  }
+  points.push([x2, y2]);
+  return points;
+}
+
+function routedEdgePath(x1, y1, x2, y2, confirmationX,
+                        offsetA, offsetB, laneHeight, centerY) {
+  return catmullRomPath(edgeWaypoints(x1, y1, x2, y2, confirmationX,
+                                      offsetA, offsetB, laneHeight, centerY));
+}
+
+function getNeighborhood(centralId) {
+  const related = EDGES.filter(e => e.source === centralId || e.target === centralId);
+  const neighborIds = [];
+  related.forEach(e => {
+    const other = e.source === centralId ? e.target : e.source;
+    if (!neighborIds.includes(other)) neighborIds.push(other);
+  });
+  return { related, neighborIds };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   LAYOUT + RENDER
+   ════════════════════════════════════════════════════════════════════ */
+
+function render() {
+  const emptyState = document.getElementById("empty-state");
+  if (!state.centralId || !NODES[state.centralId]) {
+    svg.innerHTML = "";
+    svg.setAttribute("width", 0);
+    svg.setAttribute("height", 0);
+    emptyState.style.display = "block";
+    fittedTimeDomain = renderedTimeDomain = null;
+    updateTimeControls(null, null);
+    renderCrumbs();
+    return;
+  }
+  emptyState.style.display = "none";
+
+  const central = NODES[state.centralId];
+  const { related, neighborIds } = getNeighborhood(state.centralId);
+
+  // ── lane assignment: central at offset 0, neighbours alternate above/below,
+  // ordered by edge confidence so the strongest connections sit closest.
+  const ordered = neighborIds.slice().sort((a, b) => {
+    const ea = related.find(e => e.source === a || e.target === a);
+    const eb = related.find(e => e.source === b || e.target === b);
+    return (eb.confidence || 0) - (ea.confidence || 0);
+  });
+  const laneOf = { [state.centralId]: 0 };
+  ordered.forEach((id, i) => {
+    const k = Math.ceil((i + 1) / 2);
+    laneOf[id] = (i % 2 === 0) ? k : -k;
+  });
+
+  const laneValues = Object.values(laneOf);
+  const maxAbove = Math.max(0, ...laneValues.map(v => v > 0 ? v : 0));
+  const maxBelow = Math.max(0, ...laneValues.map(v => v < 0 ? -v : 0));
+
+  // ── time domain: every node in view + zones, with padding
+  const allIds = [state.centralId, ...neighborIds];
+  const spans = allIds.map(id => nodeSpan(NODES[id]));
+  let fitMin = Math.min(...spans.map(s => s.start), ...ZONES.map(z => z.start_year));
+  let fitMax = Math.max(...spans.map(s => s.end), ...ZONES.map(z => z.end_year || NOW_YEAR), NOW_YEAR);
+  const pad = Math.max(1, Math.round((fitMax - fitMin) * 0.08));
+  fitMin -= pad; fitMax += pad;
+  fittedTimeDomain = { min: fitMin, max: fitMax };
+  const visibleDomain = state.timeWindow || fittedTimeDomain;
+  let domainMin = visibleDomain.min, domainMax = visibleDomain.max;
+  renderedTimeDomain = { min: domainMin, max: domainMax };
+
+  // ── canvas sizing
+  const marginLeft = 260, marginRight = 40, marginTop = 82, marginBottom = 36;
+  const laneHeight = 64;
+  const plotHeight = (maxAbove + maxBelow) * laneHeight + laneHeight;
+  const height = marginTop + plotHeight + marginBottom;
+  const containerWidth = document.getElementById("graph-scroll").clientWidth;
+  const width = Math.max(containerWidth, 900);
+  const plotWidth = width - marginLeft - marginRight;
+
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.innerHTML = "";
+
+  const centerY = marginTop + maxAbove * laneHeight + laneHeight / 2;
+  function laneY(id) { return centerY - laneOf[id] * laneHeight; }
+  function xScale(year) { return marginLeft + (year - domainMin) / (domainMax - domainMin) * plotWidth; }
+
+  // ── background layer
+  const bgLayer = el("g"); svg.appendChild(bgLayer);
+  const zoneLayer = el("g"); svg.appendChild(zoneLayer);
+  const gridLayer = el("g"); svg.appendChild(gridLayer);
+  const edgeLayer = el("g"); svg.appendChild(edgeLayer);
+  const nodeLayer = el("g"); svg.appendChild(nodeLayer);
+  const obsLayer = el("g"); svg.appendChild(obsLayer);
+  const labelLayer = el("g"); svg.appendChild(labelLayer);
+
+  // ── time axis ticks
+  const span = domainMax - domainMin;
+  const step = span > 40 ? 10 : span > 15 ? 5 : 1;
+  for (let y = Math.ceil(domainMin / step) * step; y <= domainMax; y += step) {
+    const x = xScale(y);
+    gridLayer.appendChild(el("line", {
+      x1: x, x2: x, y1: marginTop - 20, y2: height - marginBottom + 6,
+      stroke: "var(--hairline)", "stroke-width": 1,
+    }));
+    gridLayer.appendChild(el("text", {
+      x: x, y: marginTop - 28, "text-anchor": "middle",
+      fill: "var(--text-mute)", "font-size": 11,
+    }, [document.createTextNode(y)]));
+  }
+
+  // ── temporal zones (full-height translucent bands)
+  ZONES.forEach(z => {
+    const x1 = xScale(z.start_year), x2 = xScale(z.end_year || domainMax);
+    const rect = el("rect", {
+      class: "clickable", x: x1, y: marginTop - 20, width: Math.max(2, x2 - x1),
+      height: height - marginTop - marginBottom + 20 + 6,
+      fill: "var(--zone-fill)", stroke: "var(--zone-line)", "stroke-width": 1,
+    });
+    rect.addEventListener("click", (ev) => { ev.stopPropagation(); selectZone(z); });
+    zoneLayer.appendChild(rect);
+    zoneLayer.appendChild(el("text", {
+      x: x1 + 6, y: marginTop - 6, fill: "var(--zone-line)", "font-size": 10.5,
+    }, [document.createTextNode(z.description)]));
+  });
+
+  // ── edges: a curved link between endpoint anchors. Dated observations
+  // receive a temporal track and one clickable marker per source record.
+  related.forEach(e => {
+    const otherId = e.source === state.centralId ? e.target : e.source;
+    const datedObservations = e.observations.filter(obs =>
+      obs.year !== null && obs.year !== undefined && obs.year !== "" && Number.isFinite(Number(obs.year))
+    );
+    const hasDatedObservations = datedObservations.length > 0;
+    const { firstConfirmed, lastConfirmed } = edgeSpan(e);
+    const layoutYear = hasDatedObservations ? firstConfirmed : edgeLayoutYear(e);
+    const fx = xScale(layoutYear), lx = hasDatedObservations ? xScale(lastConfirmed) : fx;
+    const rx = hasDatedObservations ? xScale(retroStart(e)) : fx;
+    const anchorX1 = nodeAnchorX(state.centralId, layoutYear, xScale);
+    const anchorX2 = nodeAnchorX(otherId, layoutYear, xScale);
+    const y1 = laneY(state.centralId), y2 = laneY(otherId);
+    const laneDirection = Math.sign(laneOf[otherId] - laneOf[state.centralId]) || 1;
+    const trackY = centerY - (laneOf[state.centralId] + laneDirection * 0.5) * laneHeight;
+    const color = e.isPhantom ? "var(--phantom)"
+      : (e.relationship_type === "contradicts" ? "var(--limit)" : "var(--edge-hot)");
+    const density = Math.min(datedObservations.length, 6);
+
+    const group = el("g", { class: "clickable edge-group" });
+
+    if (hasDatedObservations) {
+      // Interval from the earliest endpoint records to the first dated edge record.
+      if (rx < fx - 0.5) {
+        group.appendChild(el("line", {
+          class: "edge-time-track",
+          x1: rx, x2: fx, y1: trackY, y2: trackY,
+          stroke: color, "stroke-width": 1, "stroke-dasharray": "2,4", opacity: 0.35,
+        }));
+      }
+      group.appendChild(el("line", {
+        class: "edge-time-track",
+        x1: fx, x2: Math.max(lx, fx + 0.5), y1: trackY, y2: trackY,
+        stroke: color, "stroke-width": 1.5 + density * 1.1,
+        "stroke-dasharray": e.isPhantom ? "3,4" : "none",
+        opacity: 0.5 + e.confidence * 0.4, "stroke-linecap": "round",
+      }));
+    }
+    // The link runs through the first-observation marker when a date exists.
+    // Both endpoint
+    // positions are clamped to their node geometry, and skipped node lanes
+    // are routed around rather than crossed.
+    group.appendChild(el("path", {
+      class: "edge-link",
+      d: routedEdgePath(anchorX1, y1, anchorX2, y2,
+                        fx, laneOf[state.centralId], laneOf[otherId], laneHeight, centerY),
+      fill: "none", stroke: color,
+      "stroke-width": e.isPhantom ? 1.5 : 1.5 + e.confidence * 2.2,
+      "stroke-dasharray": e.isPhantom ? "3,4" : "none",
+      opacity: e.isPhantom ? 0.55 : 0.55 + e.confidence * 0.4,
+    }));
+    group.addEventListener("click", (ev) => { ev.stopPropagation(); selectEdge(e); });
+    edgeLayer.appendChild(group);
+
+    // One marker for each dated source observation of this relationship.
+    datedObservations.forEach(obs => {
+      const ox = xScale(obs.year);
+      const tick = el("circle", {
+        class: "clickable", cx: ox, cy: trackY, r: 3.5 + obs.trust * 2.5,
+        fill: "var(--bg)", stroke: color, "stroke-width": 1.5,
+      });
+      const pointLabel = [obs.year, obs.source, obs.relationship_type].filter(Boolean).join(" · ");
+      tick.appendChild(el("title", {}, [document.createTextNode(pointLabel)]));
+      tick.addEventListener("click", (ev) => { ev.stopPropagation(); selectEdgeObservation(e, obs); });
+      tick.addEventListener("mouseenter", () => group.classList.add("is-hovered"));
+      tick.addEventListener("mouseleave", () => group.classList.remove("is-hovered"));
+      obsLayer.appendChild(tick);
+    });
+  });
+
+  // ── nodes: central + neighbours, as lines or points, plus observation ticks
+  allIds.forEach(id => {
+    const node = NODES[id];
+    const isCentral = id === state.centralId;
+    const y = laneY(id);
+    const { start, end } = nodeSpan(node);
+    const x1 = xScale(start), x2 = xScale(end);
+    const color = isCentral ? "var(--central)" : nodeColor(node);
+    const density = Math.min(node.observations.length, 8);
+    const strokeW = isCentral ? 4 + density * 1.4 : 2 + density * 1.2;
+    const hasLabelStatuses = node.observations.some(obs => Boolean(obs.label_status));
+
+    if (Math.abs(end - start) < 1e-6) {
+      // Multiple observations in one year still have no temporal span. A
+      // zero-length SVG line looks like a marker and can misplace edges, so
+      // render a point whose size gently reflects the accumulated density.
+      const dot = el("circle", {
+        class: "clickable", cx: x1, cy: y,
+        r: (isCentral ? 9 : 7) + Math.min(3, Math.max(0, density - 1) * 0.35),
+        fill: color, stroke: node.isPhantom ? color : "none",
+        "stroke-dasharray": node.isPhantom ? "2,2" : "none",
+        opacity: node.isPhantom ? 0.85 : 1,
+      });
+      dot.addEventListener("click", (ev) => { ev.stopPropagation(); nodeClicked(id); });
+      nodeLayer.appendChild(dot);
+
+      const pointObservations = node.observations.filter(obs =>
+        obs.year !== null && obs.year !== undefined && obs.year !== ""
+        && Number.isFinite(Number(obs.year))
+      );
+      pointObservations.forEach((obs, index) => {
+        const spread = (index - (pointObservations.length - 1) / 2) * 5;
+        const statusColor = labelStatusColor(obs.label_status) || color;
+        const trust = Number.isFinite(Number(obs.trust)) ? Number(obs.trust) : 0.5;
+        const marker = el("circle", {
+          class: "clickable", cx: x1 + spread, cy: y, r: 4 + trust * 2,
+          fill: "var(--bg)", stroke: statusColor, "stroke-width": 2,
+        });
+        const statusTitle = [obs.year, obs.label_status_display || obs.label_status,
+          obs.support_score === null || obs.support_score === undefined
+            ? "" : `${Math.round(Number(obs.support_score) * 100)}%`].filter(Boolean).join(" · ");
+        marker.appendChild(el("title", {}, [document.createTextNode(statusTitle)]));
+        marker.addEventListener("click", (ev) => {
+          ev.stopPropagation(); selectObservation(node, obs);
+        });
+        obsLayer.appendChild(marker);
+      });
+    } else {
+      const line = el("line", {
+        class: "clickable", x1, x2, y1: y, y2: y,
+        stroke: color, "stroke-width": hasLabelStatuses ? 1.5 : strokeW,
+        "stroke-linecap": "round",
+        "stroke-dasharray": node.isPhantom ? "6,5" : "none",
+        opacity: node.isPhantom ? 0.8 : (hasLabelStatuses ? 0.25 : 1),
+      });
+      line.addEventListener("click", (ev) => { ev.stopPropagation(); nodeClicked(id); });
+      nodeLayer.appendChild(line);
+
+      const statusTimeline = node.observations.filter(obs =>
+        obs.year !== null && obs.year !== undefined && obs.year !== ""
+        && Number.isFinite(Number(obs.year))
+      ).slice().sort((a, b) => Number(a.year) - Number(b.year));
+      statusTimeline.slice(0, -1).forEach((obs, index) => {
+        const next = statusTimeline[index + 1];
+        const support = Number.isFinite(Number(obs.support_score))
+          ? Math.max(0, Math.min(1, Number(obs.support_score))) : 0.5;
+        const statusColor = labelStatusColor(obs.label_status) || color;
+        const segment = el("line", {
+          x1: xScale(Number(obs.year)), x2: Math.max(xScale(Number(next.year)), xScale(Number(obs.year)) + 1),
+          y1: y, y2: y, stroke: statusColor,
+          "stroke-width": 1.5 + support * 6,
+          "stroke-dasharray": obs.label_status === "refutation" ? "3,3" : "none",
+          opacity: 0.35 + support * 0.65, "stroke-linecap": "round",
+          "pointer-events": "none",
+        });
+        nodeLayer.appendChild(segment);
+      });
+
+      // observation "thickenings" along the line
+      statusTimeline.forEach(obs => {
+        const ox = xScale(obs.year);
+        const statusColor = labelStatusColor(obs.label_status) || color;
+        const trust = Number.isFinite(Number(obs.trust)) ? Number(obs.trust) : 0.5;
+        const bump = el("circle", {
+          class: "clickable", cx: ox, cy: y, r: 5 + trust * 4,
+          fill: "var(--bg)", stroke: statusColor, "stroke-width": 2,
+        });
+        bump.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          selectObservation(node, obs);
+        });
+        obsLayer.appendChild(bump);
+      });
+    }
+
+    // label to the left of the lane
+    const labelText = el("text", {
+      class: "clickable", x: marginLeft - 14, y: y + 4, "text-anchor": "end",
+      fill: isCentral ? "var(--central)" : "var(--text)",
+      "font-size": isCentral ? 13.5 : 12.5,
+      "font-weight": isCentral ? 600 : 400,
+    }, [document.createTextNode((isCentral ? "\u25CF " : "") + node.text)]);
+    labelText.addEventListener("click", (ev) => { ev.stopPropagation(); nodeClicked(id); });
+    labelLayer.appendChild(labelText);
+
+    if (node.isPhantom) {
+      labelLayer.appendChild(el("text", {
+        x: marginLeft - 14, y: y + 18, "text-anchor": "end",
+        fill: "var(--phantom)", "font-size": 10, class: "mono",
+      }, [document.createTextNode("PHANTOM \u2014 не подтверждён")]));
+    }
+  });
+
+  renderCrumbs();
+  updateTimeControls(fittedTimeDomain, renderedTimeDomain);
+}
+
+function updateTimeControls(fit, view) {
+  const zoomOut = document.getElementById("time-zoom-out");
+  const zoomIn = document.getElementById("time-zoom-in");
+  const panLeft = document.getElementById("time-pan-left");
+  const panRight = document.getElementById("time-pan-right");
+  const fitButton = document.getElementById("time-fit");
+  const slider = document.getElementById("time-pan");
+  const rangeLabel = document.getElementById("time-range");
+  if (!fit || !view) {
+    [zoomOut, zoomIn, panLeft, panRight, fitButton, slider].forEach(control => control.disabled = true);
+    rangeLabel.textContent = "—";
+    return;
+  }
+
+  const fullSpan = Math.max(0, fit.max - fit.min);
+  const viewSpan = Math.max(0, view.max - view.min);
+  const latestStart = Math.max(fit.min, fit.max - viewSpan);
+  const movableSpan = latestStart - fit.min;
+  const canPan = movableSpan > 1e-6;
+  const position = canPan ? (view.min - fit.min) / movableSpan : 0;
+  slider.value = String(Math.round(Math.max(0, Math.min(1, position)) * 1000));
+  slider.disabled = !canPan;
+  zoomIn.disabled = viewSpan <= Math.min(1, fullSpan) + 1e-6;
+  zoomOut.disabled = viewSpan >= fullSpan - 1e-6;
+  panLeft.disabled = !canPan || view.min <= fit.min + 1e-6;
+  panRight.disabled = !canPan || view.min >= latestStart - 1e-6;
+  fitButton.disabled = !state.timeWindow;
+  rangeLabel.textContent = `${Math.floor(view.min)}–${Math.ceil(view.max)}`;
+  rangeLabel.title = `Показан период ${view.min.toFixed(1)}–${view.max.toFixed(1)}`;
+}
+
+function applyTimeWindow(min, span) {
+  if (!fittedTimeDomain) return;
+  const fullSpan = fittedTimeDomain.max - fittedTimeDomain.min;
+  const nextSpan = Math.max(Math.min(1, fullSpan), Math.min(fullSpan, span));
+  const latestStart = fittedTimeDomain.max - nextSpan;
+  const nextMin = Math.max(fittedTimeDomain.min, Math.min(latestStart, min));
+  state.timeWindow = nextSpan >= fullSpan - 1e-6
+    ? null : { min: nextMin, max: nextMin + nextSpan };
+  render();
+}
+
+function zoomTimeline(factor, anchorFraction = 0.5) {
+  if (!renderedTimeDomain || !fittedTimeDomain) return;
+  const currentSpan = renderedTimeDomain.max - renderedTimeDomain.min;
+  const nextSpan = Math.max(Math.min(1, fittedTimeDomain.max - fittedTimeDomain.min), currentSpan * factor);
+  const fraction = Math.max(0, Math.min(1, anchorFraction));
+  const anchor = renderedTimeDomain.min + currentSpan * fraction;
+  applyTimeWindow(anchor - nextSpan * fraction, nextSpan);
+}
+
+function panTimeline(direction) {
+  if (!renderedTimeDomain) return;
+  const span = renderedTimeDomain.max - renderedTimeDomain.min;
+  applyTimeWindow(renderedTimeDomain.min + direction * span * 0.55, span);
+}
+
+document.getElementById("time-zoom-in").addEventListener("click", () => zoomTimeline(0.65));
+document.getElementById("time-zoom-out").addEventListener("click", () => zoomTimeline(1 / 0.65));
+document.getElementById("time-pan-left").addEventListener("click", () => panTimeline(-1));
+document.getElementById("time-pan-right").addEventListener("click", () => panTimeline(1));
+document.getElementById("time-fit").addEventListener("click", () => {
+  state.timeWindow = null;
+  render();
+});
+document.getElementById("time-pan").addEventListener("input", event => {
+  if (!fittedTimeDomain || !renderedTimeDomain) return;
+  const span = renderedTimeDomain.max - renderedTimeDomain.min;
+  const maxStart = Math.max(fittedTimeDomain.min, fittedTimeDomain.max - span);
+  const fraction = Number(event.target.value) / Number(event.target.max || 1000);
+  applyTimeWindow(fittedTimeDomain.min + (maxStart - fittedTimeDomain.min) * fraction, span);
+});
+
+document.getElementById("graph-scroll").addEventListener("wheel", event => {
+  if (event.target.closest("#time-controls")) return;
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault();
+    const svgRect = svg.getBoundingClientRect();
+    const plotWidth = Math.max(1, svg.width.baseVal.value - 300);
+    const fraction = (event.clientX - svgRect.left - 260) / plotWidth;
+    zoomTimeline(event.deltaY < 0 ? 0.8 : 1.25, fraction);
+  } else if (event.shiftKey) {
+    event.preventDefault();
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    panTimeline(delta > 0 ? 1 : -1);
+  }
+}, { passive: false });
+
+/* ════════════════════════════════════════════════════════════════════
+   INTERACTIONS
+   ════════════════════════════════════════════════════════════════════ */
+
+async function nodeClicked(id) {
+  if (id === state.centralId) {
+    selectNode(NODES[id]);
+  } else {
+    await recenter(id);
+    if (NODES[id]) selectNode(NODES[id]);
+  }
+}
+
+async function recenter(id) {
+  if (state.liveMode) {
+    setLoadStatus(`загрузка окна для "${id}"\u2026`, false);
+    let data;
+    try {
+      const resp = await fetch(`${state.serverUrl}/neighborhood?id=${encodeURIComponent(id)}`);
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        setLoadStatus(`сервер: ${body.error || resp.status}`, true);
+        return;
+      }
+      data = await resp.json();
+    } catch (err) {
+      setLoadStatus(`нет связи с сервером: ${err.message}`, true);
+      return;
+    }
+    try {
+      loadGraphData(data, { centralId: id, appendHistory: true });
+      setLoadStatus(`окно вокруг "${id}"`, false);
+    } catch (err) {
+      console.error("Could not render the graph window", err);
+      setLoadStatus(`ошибка отображения графа: ${err.message}`, true);
+    }
+    return;
+  }
+  if (id !== state.centralId) state.timeWindow = null;
+  state.centralId = id;
+  if (state.history[state.history.length - 1] !== id) state.history.push(id);
+  if (state.history.length > 4) state.history = state.history.slice(-4);
+  render();
+}
+
+function renderCrumbs() {
+  const crumbs = document.getElementById("crumbs");
+  crumbs.innerHTML = "";
+  const shown = state.history.slice(-4);
+  shown.forEach((id, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "sep"; sep.textContent = "\u2192";
+      crumbs.appendChild(sep);
+    }
+    const c = document.createElement("span");
+    c.className = "crumb" + (id === state.centralId ? " current" : "");
+    c.textContent = NODES[id]?.text ?? NODE_TEXT_CACHE.get(id) ?? id;
+    c.addEventListener("click", () => recenter(id));
+    crumbs.appendChild(c);
+  });
+}
+
+/* ── panel rendering ─────────────────────────────────────────────── */
+
+function openPanel(html) {
+  document.getElementById("panel").classList.add("open");
+  document.getElementById("panel-inner").innerHTML = html;
+}
+
+function fieldRow(k, v) {
+  return `<div class="field"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[ch]);
+}
+
+function safeFieldRow(label, value) {
+  return fieldRow(escapeHtml(label), escapeHtml(value));
+}
+
+function formatMeasurement(item) {
+  if (item?.unit === "ratio") {
+    return `${item.raw_value}/${item.denominator} = ${Number(item.normalized_value).toFixed(3)}`;
+  }
+  if (item?.unit === "raw") return `${item.raw_value} (исходное значение)`;
+  return `${item.raw_value} ${item.unit} → ${Number(item.normalized_value).toFixed(3)}`;
+}
+
+function safeHttpUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch (_) { return ""; }
+}
+
+function badgeFor(node) {
+  if (node.isPhantom) return `<span class="badge phantom">phantom</span>`;
+  if (node.isVirtual) return `<span class="badge virtual">virtual forecast</span>`;
+  if (node.entity_type === "physical_limit") return `<span class="badge limit">physical_limit</span>`;
+  return `<span class="badge confirmed">${node.entity_type}</span>`;
+}
+
+function selectNode(node) {
+  const span = nodeSpan(node);
+  let html = `<button class="close-btn" onclick="closePanel()">\u00d7</button>`;
+  html += `<div class="kind">УЗЕЛ</div>`;
+  html += `<h2>${node.text}</h2>`;
+  html += `<div class="sub">${badgeFor(node)}<span class="mono">id: ${node.id}</span></div>`;
+  html += fieldRow("domain", node.domain);
+  html += fieldRow("origin_kind", node.origin_kind);
+  html += fieldRow("наблюдений (плотность)", node.observations.length);
+  html += fieldRow("охват по времени", `${span.start} \u2013 ${span.end}`);
+  if (node.maturity_score !== undefined) html += fieldRow("maturity_score", node.maturity_score.toFixed(1) + " / 10");
+  if (node.epistemic_level) html += fieldRow("epistemic_level", node.epistemic_level);
+  if (node.isVirtual) {
+    html += fieldRow("predicted_year", node.predicted_year);
+    html += fieldRow("trajectory_confidence", node.trajectory_confidence);
+  }
+  if (node.isVirtual) html += fieldRow("status", "generated during graph restructuring");
+  if (node.isPhantom) {
+    html += fieldRow("structural_gap_score", node.structural_gap_score);
+    html += fieldRow("void_pressure", node.void_pressure);
+    const range = Array.isArray(node.predicted_year_range) ? node.predicted_year_range : [];
+    if (range.length === 2) html += fieldRow("расчётный интервал", `${range[0]} – ${range[1]}`);
+    html += `<div class="snippet">${node.gap_description}</div>`;
+    (Array.isArray(node.epistemic_basis) ? node.epistemic_basis : []).forEach(basis => {
+      const sourceDetails = [basis.title || basis.source, basis.label_status]
+        .filter(value => value !== null && value !== undefined && value !== "");
+      html += `<div class="source-card">`;
+      if (sourceDetails.length) {
+        html += `<div class="source-title">Основание узла: ${sourceDetails.map(escapeHtml).join(" · ")}</div>`;
+      }
+      if (basis.text) html += `<div class="source-detail">${escapeHtml(basis.text)}</div>`;
+      if (basis.support_score !== undefined) {
+        html += `<div class="source-detail">Поддержка источника для узла: ${Number(basis.support_score).toFixed(2)}</div>`;
+      }
+      (Array.isArray(basis.evidence) ? basis.evidence : []).forEach(quote => {
+        html += `<div class="snippet"><b>Фрагмент основания узла</b><br>${escapeHtml(quote)}</div>`;
+      });
+      html += `</div>`;
+    });
+  }
+  const influenceSignals = Array.isArray(node.influence_observations)
+    ? node.influence_observations : [];
+  if (influenceSignals.length) {
+    const signalNames = {citation: "цитирование", data_use: "использование данных",
+      investment: "инвестиции", social_attention: "общественное внимание",
+      fictional_hype: "влияние художественного произведения"};
+    html += `<div class="kind">ВЛИЯНИЕ ИСТОЧНИКОВ · ${influenceSignals.length} записей</div>`;
+    influenceSignals.forEach(obs => {
+      const sourceDetails = [obs.title || obs.source, obs.year].filter(value => value !== null && value !== undefined && value !== "");
+      html += `<div class="source-card">`;
+      if (sourceDetails.length) html += `<div class="source-title">${sourceDetails.map(escapeHtml).join(" · ")}</div>`;
+      if (obs.authors?.length) html += `<div class="source-detail">Авторы: ${escapeHtml(obs.authors.join(", "))}</div>`;
+      if (obs.publication || obs.forum_topic) html += `<div class="source-detail">${escapeHtml(obs.publication || obs.forum_topic)}</div>`;
+      html += `<div class="source-detail">Тип влияния: ${escapeHtml(signalNames[obs.signal_type] || obs.signal_type)}</div>`;
+      (Array.isArray(obs.parameter_observations) ? obs.parameter_observations : []).forEach(item => {
+        html += `<div class="source-detail">Измерение ${escapeHtml(item.factor)}: ${escapeHtml(formatMeasurement(item))}</div>`;
+      });
+      if (obs.evidence) html += `<div class="snippet"><b>Цитата из источника</b><br>${escapeHtml(obs.evidence)}</div>`;
+      html += `</div>`;
+    });
+  }
+  openPanel(html);
+}
+
+function selectEdge(edge) {
+  const s = NODES[edge.source], t = NODES[edge.target];
+  const { firstConfirmed, lastConfirmed } = edgeSpan(edge);
+  const rStart = retroStart(edge);
+  let html = `<button class="close-btn" onclick="closePanel()">\u00d7</button>`;
+  html += `<div class="kind">РЕБРО${edge.isPhantom ? " \u00b7 предсказанное" : ""}</div>`;
+  html += `<h2>${escapeHtml(s.text)} \u2192 ${escapeHtml(t.text)}</h2>`;
+  html += `<div class="sub"><span class="mono">${escapeHtml(edge.relationship_type)}</span>`;
+  if (edge.isPhantom) {
+    html += `</div>`;
+    html += `<div class="source-detail">Кандидатный путь структурного прогноза. Источник, подтверждающий связь между этими узлами, не найден.</div>`;
+    (Array.isArray(edge.prediction_basis) ? edge.prediction_basis : []).forEach(basis => {
+      const sourceDetails = [basis.title || basis.source, basis.label_status]
+        .filter(value => value !== null && value !== undefined && value !== "");
+      html += `<div class="source-card">`;
+      if (sourceDetails.length) {
+        html += `<div class="source-title">Основание узла: ${sourceDetails.map(escapeHtml).join(" \u00b7 ")}</div>`;
+      }
+      if (basis.text) html += `<div class="source-detail">${escapeHtml(basis.text)}</div>`;
+      (Array.isArray(basis.evidence) ? basis.evidence : []).forEach(quote => {
+        html += `<div class="snippet"><b>Фрагмент основания узла</b><br>${escapeHtml(quote)}</div>`;
+      });
+      html += `</div>`;
+    });
+    openPanel(html);
+    return;
+  }
+  if (edge.isContested) html += ` <span class="badge disputed">РАЗНОГЛАСИЕ ИСТОЧНИКОВ</span>`;
+  html += `</div>`;
+  html += safeFieldRow("Ранние записи обоих узлов", rStart);
+  const hasDatedObservations = edge.observations.some(obs =>
+    obs.year !== null && obs.year !== undefined && obs.year !== "" && Number.isFinite(Number(obs.year))
+  );
+  if (hasDatedObservations) {
+    html += safeFieldRow("Первое наблюдение ребра", firstConfirmed);
+    html += safeFieldRow("Последнее наблюдение ребра", lastConfirmed);
+  }
+  if (edge.isContested) {
+    const votes = Object.entries(edge.relationship_type_votes || {})
+      .map(([type, weight]) => `${type}: ${Number(weight).toFixed(2)}`).join(" · ");
+    if (votes) html += safeFieldRow("Веса типов связи", votes);
+    const alternateTypes = (edge.alternate_relationship_types || []).join(", ");
+    if (alternateTypes) html += safeFieldRow("Альтернативные типы", alternateTypes);
+  }
+  html += safeFieldRow("наблюдений связи", edge.observations.length);
+  if (Number(edge.influence_corpus_size) > 0) {
+    html += safeFieldRow("документов в корпусе", Number(edge.influence_corpus_size));
+  }
+  html += fieldRow("confidence", edge.confidence.toFixed(2));
+  html += fieldRow("semantic_similarity", edge.semantic_similarity.toFixed(2));
+  html += fieldRow("temporal_proximity", edge.temporal_proximity.toFixed(2));
+  html += fieldRow("limitation_resolution", edge.limitation_resolution.toFixed(2));
+  html += fieldRow("inhibitory_force", edge.inhibitory_force.toFixed(2));
+  html += fieldRow("citation_link", edge.citation_link.toFixed(2));
+  html += fieldRow("investment_correlation", edge.investment_correlation.toFixed(2));
+  html += fieldRow("social_correlation", edge.social_correlation.toFixed(2));
+  const signalCounts = edge.signal_counts && typeof edge.signal_counts === "object" ? edge.signal_counts : {};
+  const signalNames = {citation: "цитирование", data_use: "использование данных",
+    investment: "инвестиции", social_attention: "общественное внимание",
+    fictional_hype: "влияние художественного произведения"};
+  const countDetails = Object.entries(signalCounts).filter(([, count]) => Number(count) > 0)
+    .map(([type, count]) => `${signalNames[type] || type}: ${Number(count)}`).join(" · ");
+  if (countDetails) html += safeFieldRow("уникальных источников влияния", countDetails);
+  const measurementsHtml = measurements => (Array.isArray(measurements) ? measurements : []).map(item => {
+    return `<div class="source-detail">Измерение ${escapeHtml(item.factor)}: ${escapeHtml(formatMeasurement(item))}</div>`
+      + (item.evidence ? `<div class="snippet"><b>Числовое свидетельство</b><br>${escapeHtml(item.evidence)}</div>` : "");
+  }).join("");
+  edge.observations.forEach(obs => {
+    const sourceDetails = [obs.title || obs.source, obs.year].filter(value => value !== null && value !== undefined && value !== "");
+    const quotes = Array.isArray(obs.evidence) ? obs.evidence : [];
+    const hasTrust = obs.trust !== null && obs.trust !== undefined && Number.isFinite(Number(obs.trust));
+    if (!sourceDetails.length && !obs.relationship_type && !hasTrust && !quotes.length) return;
+    html += `<div class="source-card">`;
+    if (sourceDetails.length) {
+      html += `<div class="source-title">${sourceDetails.map(escapeHtml).join(" · ")}</div>`;
+    }
+    if (obs.relationship_type) {
+      html += `<div class="source-detail">Тип связи в источнике: ${escapeHtml(obs.relationship_type)}</div>`;
+    }
+    if (obs.signal_type) {
+      const signalNames = {citation: "цитирование", data_use: "использование данных",
+        investment: "инвестиции", social_attention: "общественное внимание",
+        fictional_hype: "влияние художественного произведения"};
+      html += `<div class="source-detail">Тип влияния источника: ${escapeHtml(signalNames[obs.signal_type] || obs.signal_type)}</div>`;
+    }
+    if (hasTrust) {
+      html += `<div class="source-detail">Вес доверия источнику: ${Number(obs.trust).toFixed(2)}</div>`;
+    }
+    html += measurementsHtml(obs.parameter_observations);
+    quotes.forEach((quote, i) => {
+      html += `<div class="snippet"><b>Цитата из источника ${i + 1}</b><br>${escapeHtml(quote)}</div>`;
+    });
+    html += `</div>`;
+  });
+  (Array.isArray(edge.signals) ? edge.signals : []).forEach(obs => {
+    const sourceDetails = [obs.title || obs.source, obs.year].filter(value => value !== null && value !== undefined && value !== "");
+    html += `<div class="source-card">`;
+    if (sourceDetails.length) html += `<div class="source-title">${sourceDetails.map(escapeHtml).join(" · ")}</div>`;
+    if (obs.authors?.length) html += `<div class="source-detail">Авторы: ${escapeHtml(obs.authors.join(", "))}</div>`;
+    if (obs.publication || obs.forum_topic) html += `<div class="source-detail">${escapeHtml(obs.publication || obs.forum_topic)}</div>`;
+    html += `<div class="source-detail">Тип влияния: ${escapeHtml(signalNames[obs.signal_type] || obs.signal_type)}</div>`;
+    html += measurementsHtml(obs.parameter_observations);
+    (Array.isArray(obs.evidence) ? obs.evidence : []).forEach(quote => {
+      html += `<div class="snippet"><b>Цитата из источника</b><br>${escapeHtml(quote)}</div>`;
+    });
+    html += `</div>`;
+  });
+  openPanel(html);
+}
+
+function selectEdgeObservation(edge, obs) {
+  const s = NODES[edge.source], t = NODES[edge.target];
+  const sourceRelation = obs.signal_type ? "" : (obs.relationship_type || edge.relationship_type);
+  const alternate = Boolean(sourceRelation) && sourceRelation !== edge.relationship_type;
+  let html = `<button class="close-btn" onclick="closePanel()">\u00d7</button>`;
+  html += `<div class="kind">НАБЛЮДЕНИЕ СВЯЗИ${alternate ? " · альтернативный тип" : ""}</div>`;
+  html += `<h2>${escapeHtml(s.text)} \u2192 ${escapeHtml(t.text)}</h2>`;
+  const sourceDetails = [obs.title || obs.source, obs.year].filter(value => value !== null && value !== undefined && value !== "");
+  if (sourceDetails.length) html += `<div class="sub">${sourceDetails.map(escapeHtml).join(" \u00b7 ")}</div>`;
+  if (obs.signal_type) {
+    const signalNames = {citation: "цитирование", data_use: "использование данных",
+      investment: "инвестиции", social_attention: "общественное внимание",
+      fictional_hype: "влияние художественного произведения"};
+    html += safeFieldRow("тип влияния источника", signalNames[obs.signal_type] || obs.signal_type);
+  }
+  if (sourceRelation) html += safeFieldRow("тип связи в этом источнике", sourceRelation);
+  if (obs.trust !== null && obs.trust !== undefined && Number.isFinite(Number(obs.trust))) {
+    html += safeFieldRow("Вес доверия источнику", Number(obs.trust).toFixed(2));
+  }
+  const quotes = Array.isArray(obs.evidence) ? obs.evidence : [];
+  if (quotes.length) quotes.forEach((quote, i) => {
+    html += `<div class="snippet"><b>Цитата из источника ${i + 1}</b><br>${escapeHtml(quote)}</div>`;
+  });
+  openPanel(html);
+}
+
+function selectObservation(node, obs) {
+  let html = `<button class="close-btn" onclick="closePanel()">\u00d7</button>`;
+  if (obs.is_aggregate) {
+    const nodeOnly = obs.aggregate_reason === "node_metadata_only";
+    html += `<div class="kind">${nodeOnly ? "МЕТАДАННЫЕ УЗЛА" : "ВРЕМЕННАЯ ПЛОТНОСТЬ"}</div>`;
+    html += `<h2>${escapeHtml(node.text)}</h2>`;
+    if (obs.year !== null && obs.year !== undefined) {
+      html += safeFieldRow(nodeOnly ? "год узла" : "год профиля", obs.year);
+    }
+    if (obs.weight !== null && obs.weight !== undefined) {
+      html += safeFieldRow("относительная плотность", Number(obs.weight).toFixed(2));
+    }
+    openPanel(html);
+    return;
+  }
+
+    const statusEventNames = {
+      refutation: "ОПРОВЕРЖЕНИЕ МЕТКИ",
+      supports: "ПОДДЕРЖКА МЕТКИ",
+      confirms: "ПОДТВЕРЖДЕНИЕ МЕТКИ",
+      proves: "ДОКАЗАТЕЛЬСТВО МЕТКИ"
+    };
+    html += `<div class="kind">${statusEventNames[obs.event_type] || "НАБЛЮДЕНИЕ УЗЛА"}</div>`;
+  html += `<h2>${escapeHtml(node.text)}</h2>`;
+    if (obs.label_status_display || obs.label_status) {
+      html += safeFieldRow(obs.is_status_change ? "Статус метки после события" : "Статус метки к этой дате",
+        obs.label_status_display || obs.label_status);
+    }
+    if (obs.source_label_status_display
+        && obs.source_label_status !== obs.label_status) {
+      html += safeFieldRow("Статус источника", obs.source_label_status_display);
+    }
+    if (obs.support_score !== null && obs.support_score !== undefined
+        && Number.isFinite(Number(obs.support_score))) {
+      html += safeFieldRow("Поддержка метки к этой дате",
+        `${(Number(obs.support_score) * 100).toFixed(1)}%`);
+    }
+    if (obs.is_refutation_event && obs.source_node_text) {
+      html += safeFieldRow("Утверждение из опровергающего узла", obs.source_node_text);
+    }
+  const sourceTitle = obs.title || obs.source;
+  const hasSourceCard = Boolean(sourceTitle || (obs.authors && obs.authors.length) || obs.publication || obs.forum_topic || obs.source_url || (obs.source_type && obs.source_type !== "unknown"));
+  if (hasSourceCard) html += `<div class="source-card">`;
+  if (sourceTitle) html += `<div class="source-title">${escapeHtml(sourceTitle)}</div>`;
+  if (Array.isArray(obs.authors) && obs.authors.length) {
+    html += `<div class="source-detail">Авторы: ${escapeHtml(obs.authors.join(", "))}</div>`;
+  }
+  if (obs.publication) html += `<div class="source-detail">Издание / площадка: ${escapeHtml(obs.publication)}</div>`;
+  if (obs.forum_topic) html += `<div class="source-detail">Тема: ${escapeHtml(obs.forum_topic)}</div>`;
+  if (obs.source_type && obs.source_type !== "unknown") {
+    html += `<div class="source-detail">Тип источника: ${escapeHtml(obs.source_type)}</div>`;
+  }
+  const href = safeHttpUrl(obs.source_url);
+  if (href) html += `<div class="source-detail"><a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">Открыть источник</a></div>`;
+  else if (obs.source_url) html += `<div class="source-detail">URL / DOI: ${escapeHtml(obs.source_url)}</div>`;
+  else if (obs.source && obs.title && obs.source !== obs.title) {
+    html += `<div class="source-detail">Файл / идентификатор: ${escapeHtml(obs.source)}</div>`;
+  }
+  if (hasSourceCard) html += `</div>`;
+  if (obs.publication_date || obs.year) html += safeFieldRow("Дата публикации", obs.publication_date || obs.year);
+  if (obs.trust !== null && obs.trust !== undefined && Number.isFinite(Number(obs.trust))) {
+    html += safeFieldRow("Вес доверия источнику", Number(obs.trust).toFixed(2));
+  }
+  const quotes = Array.isArray(obs.evidence) && obs.evidence.length
+    ? obs.evidence : (obs.snippet ? [obs.snippet] : []);
+    if (quotes.length) quotes.forEach((quote, i) => {
+      const quoteTitle = i === 0 && (obs.label_status || obs.label_status_display)
+        ? "Цитата из источника · основание статуса"
+        : `Цитата из источника ${i + 1}`;
+      html += `<div class="snippet"><b>${escapeHtml(quoteTitle)}</b><br>${escapeHtml(quote)}</div>`;
+  });
+  if (obs.date_evidence) html += `<div class="snippet" style="border-left-color:var(--text-dim)"><b>Основание даты</b><br>${escapeHtml(obs.date_evidence)}</div>`;
+  if (obs.context) html += `<div class="snippet" style="border-left-color:var(--text-dim)"><b>Контекст анализа (не цитата)</b><br>${escapeHtml(obs.context)}</div>`;
+  openPanel(html);
+}
+
+function selectZone(zone) {
+  let html = `<button class="close-btn" onclick="closePanel()">\u00d7</button>`;
+  html += `<div class="kind">ВРЕМЕННАЯ ЗОНА</div>`;
+  html += `<h2>${zone.description}</h2>`;
+  html += `<div class="sub">${zone.domain_focus}</div>`;
+  html += fieldRow("start_year", zone.start_year);
+  html += fieldRow("end_year", zone.end_year ?? "\u2014 (продолжается)");
+  html += fieldRow("zone_multiplier", "\u00d7" + zone.zone_multiplier);
+  html += fieldRow("узлов внутри", zone.contained_node_ids.length);
+  html += `<div class="snippet">${zone.contained_node_ids.map(id => NODES[id].text).join(", ")}</div>`;
+  openPanel(html);
+}
+
+function closePanel() {
+  document.getElementById("panel").classList.remove("open");
+}
+window.closePanel = closePanel;
+
+/* ── search ──────────────────────────────────────────────────────── */
+
+const searchInput = document.getElementById("search");
+const suggestBox = document.getElementById("suggestions");
+let searchDebounce = null;
+
+function renderSuggestions(matches) {
+  suggestBox.innerHTML = "";
+  if (!matches.length) { suggestBox.classList.remove("open"); return; }
+  matches.forEach(n => {
+    const row = document.createElement("div");
+    row.className = "suggestion";
+    row.innerHTML = `<span>${n.text}</span><span class="stype">${n.isPhantom ? "phantom" : n.entity_type}</span>`;
+    row.addEventListener("click", () => {
+      recenter(n.id);
+      searchInput.value = "";
+      suggestBox.classList.remove("open");
+    });
+    suggestBox.appendChild(row);
+  });
+  suggestBox.classList.add("open");
+}
+
+searchInput.addEventListener("input", () => {
+  const q = searchInput.value.trim();
+  if (!q) { suggestBox.innerHTML = ""; suggestBox.classList.remove("open"); return; }
+
+  if (state.liveMode) {
+    // Debounced: a live graph means a real query per keystroke otherwise —
+    // 250ms of no typing before it fires.
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(async () => {
+      try {
+        const resp = await fetch(`${state.serverUrl}/search?q=${encodeURIComponent(q)}&limit=8`);
+        if (!resp.ok) { setLoadStatus(`поиск: сервер вернул ${resp.status}`, true); return; }
+        const data = await resp.json();
+        renderSuggestions((data.results || []).map(r => ({ ...r, isPhantom: false })));
+      } catch (err) {
+        setLoadStatus(`поиск: нет связи с сервером (${err.message})`, true);
+      }
+    }, 250);
+    return;
+  }
+
+  const ql = q.toLowerCase();
+  const matches = Object.values(NODES).filter(n =>
+    n.text.toLowerCase().includes(ql) || n.id.toLowerCase().includes(ql)
+  ).slice(0, 8);
+  renderSuggestions(matches);
+});
+
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest(".search-wrap")) suggestBox.classList.remove("open");
+});
+
+/* ── legend toggle ───────────────────────────────────────────────── */
+
+document.getElementById("legend-toggle").addEventListener("click", () => {
+  document.getElementById("legend").classList.toggle("open");
+});
+
+/* ── connect to a live graph ─────────────────────────────────────────
+   Talks to serve_visualizer_api() (oracle1.py): GET /neighborhood?id=...
+   and GET /search?q=... Never asks for, or receives, the whole graph —
+   at real Oracle-1 scale (hundreds of billions of nodes) no export or
+   transfer of "everything" could exist in the first place; every
+   request here is scoped to exactly one node's own 1-hop window
+   (get_node_window()) or a bounded search result list. ────────────── */
+
+const loadStatus = document.getElementById("load-status");
+
+function setLoadStatus(text, isError) {
+  loadStatus.textContent = text;
+  loadStatus.style.color = isError ? "var(--limit)" : "var(--text-dim)";
+}
+
+document.getElementById("connect-btn").addEventListener("click", async () => {
+  const url = document.getElementById("server-url").value.trim().replace(/\/$/, "");
+  if (!url) { setLoadStatus("укажите адрес сервера", true); return; }
+  setLoadStatus("проверка соединения\u2026", false);
+  let graphStatus = null;
+  try {
+    const resp = await fetch(`${url}/search?q=&limit=1`);
+    if (!resp.ok) {
+      setLoadStatus(`сервер ответил ${resp.status}`, true);
+      return;
+    }
+    const payload = await resp.json();
+    if (!payload || !Array.isArray(payload.results)) {
+      setLoadStatus("сервер ответил, но API графа несовместим", true);
+      return;
+    }
+    graphStatus = payload.graph || null;
+  } catch (err) {
+    setLoadStatus(`не удалось подключиться: ${err.message}`, true);
+    return;
+  }
+  state.liveMode = true;
+  state.serverUrl = url;
+  state.centralId = null;
+  state.history = [];
+  state.timeWindow = null;
+  closePanel();
+  render();
+  const nodeCount = graphStatus && Number.isFinite(graphStatus.nodes)
+    ? graphStatus.nodes : null;
+  const edgeCount = graphStatus && Number.isFinite(graphStatus.edges)
+    ? graphStatus.edges : null;
+  const counts = nodeCount !== null && edgeCount !== null
+    ? ` · ${nodeCount.toLocaleString()} узлов / ${edgeCount.toLocaleString()} рёбер` : "";
+  if (nodeCount === 0) {
+    document.getElementById("empty-state").textContent =
+      "Граф подключён, но snapshot пуст (0 узлов, 0 рёбер). Сначала выполните graph-update с работающим LLM.";
+    setLoadStatus("подключено · граф пуст", false);
+  } else if (graphStatus && graphStatus.mode === "citation_preview") {
+    document.getElementById("empty-state").textContent =
+      "Цитатный preview: показаны только DOI-ссылки из References; семантический анализ статей через LLM ещё не выполнялся. Найдите статью выше.";
+    setLoadStatus(`цитатный preview${counts} · найдите статью`, false);
+  } else if (graphStatus && graphStatus.mode === "simulated_llm_response") {
+    document.getElementById("empty-state").textContent =
+      "Симуляция: узлы и рёбра сформированы детерминированными ответами-заглушками по тексту статей. Это не результат анализа реальной LLM и не научный вывод.";
+    setLoadStatus(`симуляция ответов LLM${counts} · найдите статью`, false);
+  } else {
+    document.getElementById("empty-state").textContent =
+      "Граф подключён. Найдите узел через поле поиска выше, чтобы открыть его соседей.";
+    setLoadStatus(`подключено${counts} · найдите узел`, false);
+  }
+});
+
+/* ── resize ──────────────────────────────────────────────────────── */
+
+window.addEventListener("resize", render);
+
+/* ── init ────────────────────────────────────────────────────────── */
+
+loadGraphData(
+  { nodes: DEMO_NODES, edges: DEMO_EDGES, zones: DEMO_ZONES },
+  { centralId: "quantum_chip" }
+);
+</script>
+</body>
+</html>

@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from oracle1 import (
     # Модель и граф
@@ -55,17 +54,20 @@ from oracle1 import (
     build_oracle1_system,
     CONFIG as ORACLE_CONFIG,
     # Типы данных
-    KnowledgeNode,
-    KnowledgeEdge,
     RuntimeGraph,
-    # Фиче-билдеры
-    NodeFeatureBuilder,
-    EdgeFeatureBuilder,
     # Детектор прорывов
     HighConvergenceDetector,
-    # Вспомогательные константы
-    N_EXTENDED_COMPONENTS,
-    V6_EDGE_WEIGHTS,
+    # TODO #4: graph_to_tensors used to be defined locally in this file
+    # (see git history / TODO.md #4) — relocated into oracle1.py so
+    # train.py can share it too (needed to compute real phantom-scan
+    # node_latents instead of a hardcoded None). compute_node_latents is
+    # the new graph_to_tensors()+encode() convenience wrapper.
+    graph_to_tensors,
+    compute_node_latents,
+    HashingTextEmbedder,
+    # TODO #2: graph (de)serialization, shared with train.py.
+    save_graph_snapshot,
+    load_graph_snapshot,
 )
 
 logging.basicConfig(
@@ -146,129 +148,8 @@ def find_best_checkpoint(save_dir: Path) -> Optional[Path]:
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  КОНВЕРТАЦИЯ ГРАФА В ТЕНЗОРЫ
-# ══════════════════════════════════════════════════════════════════════════════
-
-def graph_to_tensors(
-    graph:   RuntimeGraph,
-    device:  torch.device,
-    node_fb: Optional[NodeFeatureBuilder] = None,
-    edge_fb: Optional[EdgeFeatureBuilder] = None,
-    extended=None,          # Bug 7 fix: Oracle1Extended for topology_vecs
-) -> Optional[Dict[str, torch.Tensor]]:
-    """Конвертировать RuntimeGraph в тензоры для Oracle1Model.encode().
-
-    Возвращает словарь с ключами:
-      node_features, edge_index, edge_attr,
-      containment_index, containment_zone_mult,
-      node_years, node_zone_mult, topology_vecs (optional)
-
-    Возвращает None если граф пустой (нет узлов).
-
-    Bug 7 fix: если передан extended (Oracle1Extended), запрашивает
-    get_topology_vecs_tensor() и включает результат в словарь под ключом
-    topology_vecs, чтобы encode() мог активировать ContextualPriorityHead.
-    """
-    node_ids = list(graph.nodes.keys())
-    if not node_ids:
-        return None
-
-    node_fb = node_fb or NodeFeatureBuilder()
-    edge_fb = edge_fb or EdgeFeatureBuilder()
-
-    # ── Признаки узлов ────────────────────────────────────────────────────────
-    node_idx: Dict[str, int] = {nid: i for i, nid in enumerate(node_ids)}
-    node_feat_list = []
-    node_years_list = []
-    node_zone_mult_list = []
-
-    for nid in node_ids:
-        node = graph.nodes[nid]
-        try:
-            feat = node_fb.build(node)
-        except Exception:
-            feat = np.zeros(NodeFeatureBuilder.TOTAL_DIM, dtype=np.float32)
-        node_feat_list.append(feat)
-
-        # Год из timestamp (Unix → calendar year approximation)
-        year = int(node.timestamp / 31_536_000 + 1970) if node.timestamp != 0 else 2000
-        node_years_list.append(max(1700, min(year, 2100)))
-        node_zone_mult_list.append(float(node.acceleration_multiplier))
-
-    node_features = torch.tensor(
-        np.stack(node_feat_list), dtype=torch.float32, device=device
-    )
-    node_years = torch.tensor(node_years_list, dtype=torch.float32, device=device)
-    node_zone_mult = torch.tensor(node_zone_mult_list, dtype=torch.float32, device=device)
-
-    # ── Рёбра (обычные и containment) ─────────────────────────────────────────
-    edge_src, edge_tgt, edge_attr_list = [], [], []
-    cont_src, cont_tgt, cont_mult_list = [], [], []
-
-    for (src_id, tgt_id), edge in graph.edges.items():
-        if src_id not in node_idx or tgt_id not in node_idx:
-            continue
-        si, ti = node_idx[src_id], node_idx[tgt_id]
-        if edge.is_containment_edge:
-            cont_src.append(si)
-            cont_tgt.append(ti)
-            cont_mult_list.append(
-                float(graph.nodes[src_id].zone_multiplier)
-                if src_id in graph.nodes else 1.0
-            )
-        else:
-            try:
-                attr = edge_fb.build(edge)
-            except Exception:
-                attr = np.zeros(EdgeFeatureBuilder.DIM, dtype=np.float32)
-            edge_src.append(si)
-            edge_tgt.append(ti)
-            edge_attr_list.append(attr)
-
-    # edge_index
-    if edge_src:
-        edge_index = torch.tensor(
-            [edge_src, edge_tgt], dtype=torch.long, device=device
-        )
-        edge_attr = torch.tensor(
-            np.stack(edge_attr_list), dtype=torch.float32, device=device
-        )
-    else:
-        edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-        edge_attr  = torch.zeros((0, EdgeFeatureBuilder.DIM),
-                                 dtype=torch.float32, device=device)
-
-    # containment_index
-    if cont_src:
-        containment_index = torch.tensor(
-            [cont_src, cont_tgt], dtype=torch.long, device=device
-        )
-        containment_zone_mult = torch.tensor(
-            cont_mult_list, dtype=torch.float32, device=device
-        )
-    else:
-        containment_index     = torch.zeros((2, 0), dtype=torch.long, device=device)
-        containment_zone_mult = torch.zeros(0, dtype=torch.float32, device=device)
-
-    # Bug 7 fix: attach topology_vecs when Oracle1Extended is available
-    topology_vecs = None
-    if extended is not None and hasattr(extended, "get_topology_vecs_tensor"):
-        topology_vecs = extended.get_topology_vecs_tensor(node_ids, device=device)
-
-    result = dict(
-        node_features        = node_features,
-        edge_index           = edge_index,
-        edge_attr            = edge_attr,
-        containment_index    = containment_index,
-        containment_zone_mult= containment_zone_mult,
-        node_years           = node_years,
-        node_zone_mult       = node_zone_mult,
-        node_ids             = node_ids,   # вспомогательное поле, не подаётся в модель
-    )
-    if topology_vecs is not None:
-        result["topology_vecs"] = topology_vecs
-    return result
+# graph_to_tensors() is now imported from oracle1 (see the import block
+# above) — relocated there for TODO #4 so train.py can share it too.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,13 +162,17 @@ def run_neural_inference(
     tensors: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Прогнать граф через нейросеть.
+    """Прогнать вспомогательный оценщик контекстного влияния по графу.
 
     Возвращает:
       node_latents   — [N, latent_dim]  скрытые представления
       node_features  — [N, feat_dim]    обновлённые признаки
-      forecast_scores— [N]              предсказанный readiness score
       node_ids       — List[str]        порядок узлов
+
+    ForecastHead deliberately is not read here. Ordinary training supervises
+    edge existence and the seven edge components, not future outcomes;
+    presenting its untrained output as a breakthrough probability would be a
+    category error. Ranking remains a transparent graph operation.
     """
     model.eval()
 
@@ -295,6 +180,9 @@ def run_neural_inference(
     node_ids = tensors.pop("node_ids")
     try:
         # Bug 7 fix: pass topology_vecs so ContextualPriorityHead modulates attention
+        # TODO #10: pass edge_provenance_discount so StructuralDependencyUpdater's
+        # sdi/casc scatter_add is discounted the same way excess_investment_pressure
+        # already is (see compute_ancestor_overlap_discount in oracle1.py).
         node_latents, node_features_upd = model.encode(
             node_features         = tensors["node_features"],
             edge_index            = tensors["edge_index"],
@@ -304,15 +192,11 @@ def run_neural_inference(
             node_years            = tensors["node_years"],
             node_zone_mult        = tensors["node_zone_mult"],
             topology_vecs         = tensors.get("topology_vecs"),
+            edge_provenance_discount = tensors.get("edge_provenance_discount"),
         )
-        forecast_scores = model.predict_forecast(
-            node_latents, node_features_upd
-        ).squeeze(-1)                       # [N]
-
         return dict(
             node_latents    = node_latents,
             node_features   = node_features_upd,
-            forecast_scores = forecast_scores,
             node_ids        = node_ids,
         )
     finally:
@@ -415,7 +299,7 @@ def mode_query(args: argparse.Namespace, system: Dict[str, Any],
     extended = system["extended"]
 
     # Простой embedder, если не подключён внешний
-    embedder = _get_embedder()
+    embedder = _get_embedder(system)
 
     log.info(f"\n{'═'*64}")
     log.info(f"  QUERY MODE: «{args.query}»")
@@ -428,16 +312,17 @@ def mode_query(args: argparse.Namespace, system: Dict[str, Any],
     )
     print("\n" + cloud.to_readable())
 
-    # Если доступны нейросетевые латенты — найти top-K узлов по forecast_score
+    # Latents make edge influence queries possible; node ranking stays a
+    # graph-derived diagnostic, never an unsupervised neural forecast.
     if neural is not None:
-        _print_neural_top_nodes(neural, system["graph"], k=args.top_k)
+        _print_structural_top_nodes(system["graph"], k=args.top_k)
 
 
 def mode_forecast(args: argparse.Namespace, system: Dict[str, Any],
                   neural: Optional[Dict[str, Any]]) -> None:
     """Рекурсивный прогноз будущих технологий."""
     extended = system["extended"]
-    embedder = _get_embedder()
+    embedder = _get_embedder(system)
 
     log.info(f"\n{'═'*64}")
     log.info(f"  FORECAST MODE: «{args.query}»  depth={args.depth}")
@@ -465,7 +350,7 @@ def mode_forecast(args: argparse.Namespace, system: Dict[str, Any],
         if sc.hallucinated_nodes:
             print(f"  Галлюцинированные узлы ({len(sc.hallucinated_nodes)}):")
             for hn in sc.hallucinated_nodes[:5]:
-                print(f"    [{hn.confidence:.2f}] {hn.text[:60]}")
+                print(f"    [{hn.confidence:.2f}] {hn.node.text[:60]}")
         if sc.secondary_effects:
             print(f"  Вторичные эффекты:")
             for eff in sc.secondary_effects[:3]:
@@ -517,9 +402,9 @@ def mode_scan(args: argparse.Namespace, system: Dict[str, Any],
                          key=lambda p: p.structural_gap_score, reverse=True)[:args.top_k]:
             print(f"  [{ph.structural_gap_score:.3f}] {ph.gap_description[:60]}")
 
-    # ── Нейросетевые оценки ───────────────────────────────────────────────
+    # ── Структурный рейтинг ───────────────────────────────────────────────
     if neural is not None:
-        _print_neural_top_nodes(neural, system["graph"], k=args.top_k)
+        _print_structural_top_nodes(system["graph"], k=args.top_k)
 
 
 def mode_edge(args: argparse.Namespace, system: Dict[str, Any],
@@ -602,71 +487,51 @@ def mode_report(args: argparse.Namespace, system: Dict[str, Any],
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _get_embedder():
-    """Вернуть простой embedder. Пробует sentence-transformers, fallback — хэш."""
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        log.info("[embedder] SentenceTransformer loaded (all-MiniLM-L6-v2)")
-
-        class _STEmbedder:
-            def encode(self, text: str) -> np.ndarray:
-                return model.encode(text, show_progress_bar=False)
-
-        return _STEmbedder()
-
-    except ImportError:
-        pass
-
-    # Fallback: детерминированный хэш-вектор
-    log.warning(
-        "[embedder] sentence-transformers не установлен. "
-        "Используется hash-embedder (качество ниже). "
-        "Установите: pip install sentence-transformers"
-    )
-
-    class _HashEmbedder:
-        DIM = 384
-
-        def encode(self, text: str) -> np.ndarray:
-            import hashlib
-            seed = int(hashlib.md5(text.encode()).hexdigest(), 16) % (2**32)
-            rng  = np.random.default_rng(seed)
-            vec  = rng.standard_normal(self.DIM).astype(np.float32)
-            return vec / (np.linalg.norm(vec) + 1e-8)
-
-    return _HashEmbedder()
+def _get_embedder(system: Optional[Dict[str, Any]] = None):
+    """Use the encoder that built the loaded graph's text features."""
+    if system is not None and system.get("embedder") is not None:
+        return system["embedder"]
+    return HashingTextEmbedder()
 
 
-def _print_neural_top_nodes(
-    neural: Dict[str, Any],
-    graph:  RuntimeGraph,
-    k:      int = 10,
-) -> None:
-    """Вывести топ-K узлов по нейросетевому forecast_score."""
-    scores   = neural["forecast_scores"].cpu().numpy()
-    node_ids = neural["node_ids"]
-
-    order = np.argsort(scores)[::-1][:k]
-
-    print(f"\n── Neural Top-{k} Breakthrough Candidates (forecast_score) ──")
-    for rank, idx in enumerate(order, 1):
-        nid   = node_ids[idx]
-        node  = graph.get_node(nid)
-        label = node.text[:55] if node else nid
-        score = scores[idx]
-        bar   = "█" * int(score * 10 / scores[order[0]] * 20) if scores[order[0]] > 0 else ""
-        print(f"  {rank:2}. [{score:6.3f}] {label}  {bar}")
+def _print_structural_top_nodes(graph: RuntimeGraph, k: int = 10) -> None:
+    """Show graph-derived diagnostics, explicitly not neural probabilities."""
+    rows = sorted(
+        graph.nodes.values(),
+        key=lambda node: (
+            float(getattr(node, "forecast_score", 0.0)),
+            float(getattr(node, "convergence_potential", 0.0)),
+            float(getattr(node, "upstream_pressure", 0.0)),
+        ),
+        reverse=True,
+    )[:k]
+    print(f"\n── Structural Top-{k} Candidates (diagnostic, not probability) ──")
+    for rank, node in enumerate(rows, 1):
+        print(
+            f"  {rank:2}. [struct={node.forecast_score:6.3f}  "
+            f"potential={node.convergence_potential:6.3f}] {node.text[:70]}"
+        )
 
 
-def _run_graph_steps(system: Dict[str, Any], n_steps: int) -> None:
-    """Прогреть символическую часть системы."""
+def _run_graph_steps(system: Dict[str, Any], n_steps: int,
+                     device: Optional[torch.device] = None) -> None:
+    """Прогреть символическую часть системы.
+
+    TODO #4 fix: thread real node_latents into update_epoch() (via
+    compute_node_latents(), same as train.py's oracle_graph_step()) instead
+    of relying on the old hardcoded node_latents=None inside
+    Oracle1Extended.update_epoch() — without this, phantom-void scanning
+    silently always returned no phantoms.
+    """
     if n_steps <= 0:
         return
     log.info(f"[graph] Запускаем {n_steps} шагов символической симуляции…")
     for step in range(n_steps):
         ts = float(time.time())
-        ext = system["extended"].update_epoch(ts)
+        node_latents = (compute_node_latents(system["model"], system["graph"], device,
+                                             extended=system["extended"])
+                        if device is not None else None)
+        ext = system["extended"].update_epoch(ts, node_latents=node_latents)
         dyn = system["dynamics"].run_epoch(ts)
         topo = system["topology"].run_epoch(ts)
 
@@ -732,6 +597,18 @@ def parse_args() -> argparse.Namespace:
     common.add_argument(
         "--output_json", default=None,
         help="Сохранить результаты в JSON-файл"
+    )
+    common.add_argument(
+        "--graph_snapshot", default=None,
+        help=(
+            "Путь к снапшоту графа (nodes/edges/zones/phantoms/virtual_nodes), "
+            "тот же формат, что и --graph_snapshot в train.py. Если файл "
+            "существует — загружается ДО --graph_steps. Если флаг передан, "
+            "состояние сохраняется обратно в тот же файл ПОСЛЕ --graph_steps, "
+            "так что несколько запусков run.py тоже накапливают рост графа, "
+            "а не только train.py (TODO #2: 'across training resumes and "
+            "inference calls')."
+        )
     )
 
     # ── query ─────────────────────────────────────────────────────────────────
@@ -802,6 +679,11 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Oracle1Model  параметров: {n_params:,}")
 
+    # ── TODO #2: restore graph snapshot, if given and present ─────────────────
+    if args.graph_snapshot and Path(args.graph_snapshot).exists():
+        snap_counts = load_graph_snapshot(args.graph_snapshot, system)
+        log.info(f"[graph_snapshot] Восстановлено из {args.graph_snapshot}: {snap_counts}")
+
     # ── Загрузить веса ─────────────────────────────────────────────────────────
     ckpt_path: Optional[Path] = None
     if args.ckpt:
@@ -823,7 +705,16 @@ def main() -> None:
         load_model_weights(model, ckpt_path, device)
 
     # ── Прогреть граф ──────────────────────────────────────────────────────────
-    _run_graph_steps(system, args.graph_steps)
+    # TODO #4: pass device through so phantom-void scanning gets real node
+    # latents (skipped — node_latents=None — when --no_neural, matching the
+    # "no neural inference at all" intent of that flag).
+    _run_graph_steps(system, args.graph_steps, device=None if args.no_neural else device)
+
+    # TODO #2: persist any growth from --graph_steps back to the same
+    # snapshot, so a sequence of run.py invocations accumulates state too,
+    # not just train.py runs.
+    if args.graph_snapshot:
+        save_graph_snapshot(args.graph_snapshot, system)
 
     graph = system["graph"]
     log.info(
@@ -873,8 +764,11 @@ def main() -> None:
                     "node_id": nid,
                     "text":   (graph.get_node(nid).text
                                if graph.get_node(nid) else ""),
-                    "forecast_score": float(
-                        neural_results["forecast_scores"][idx].item()
+                    "structural_score": float(
+                        getattr(graph.get_node(nid), "forecast_score", 0.0)
+                    ),
+                    "convergence_potential": float(
+                        getattr(graph.get_node(nid), "convergence_potential", 0.0)
                     ),
                 }
                 for i, (idx, nid) in enumerate(
@@ -883,14 +777,17 @@ def main() -> None:
                             range(len(neural_results["node_ids"])),
                             neural_results["node_ids"],
                         ),
-                        key=lambda x: neural_results["forecast_scores"][x[0]].item(),
+                        key=lambda x: (
+                            float(getattr(graph.get_node(x[1]), "forecast_score", 0.0)),
+                            float(getattr(graph.get_node(x[1]), "convergence_potential", 0.0)),
+                        ),
                         reverse=True,
                     )
                 )[:args.top_k]
             ],
         }
         Path(args.output_json).write_text(
-            json.dumps(out, ensure_ascii=False, indent=2)
+            json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         log.info(f"[json] результаты сохранены → {args.output_json}")
 
