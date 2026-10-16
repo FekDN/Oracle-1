@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Evidence-based edge factor derivation and source aggregation."""
 
 from __future__ import annotations
