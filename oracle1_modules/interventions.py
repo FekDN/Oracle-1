@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Intervention definitions, simulation, and optimization."""
 from __future__ import annotations
 
