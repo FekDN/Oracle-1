@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Live graph queries and the visualizer HTTP API."""
 from __future__ import annotations
 
