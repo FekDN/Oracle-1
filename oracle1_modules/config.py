@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Central configuration and derived runtime constants."""
 from __future__ import annotations
 
