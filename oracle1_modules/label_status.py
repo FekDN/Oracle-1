@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Evidence status codes and time-ordered support calculations for graph labels."""
 from __future__ import annotations
 
