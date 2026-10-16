@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Topology, structural tension, and phase-transition analysis."""
 from __future__ import annotations
 
