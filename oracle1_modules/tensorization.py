@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Conversion between runtime graphs and model tensors."""
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ def graph_to_tensors(
 
     Возвращает None если граф пустой (нет узлов).
 
-    Bug 7 fix: если передан extended (Oracle1Extended), запрашивает
+    Если передан extended (Oracle1Extended), запрашивает
     get_topology_vecs_tensor() и включает результат в словарь под ключом
     topology_vecs, чтобы encode() мог активировать ContextualPriorityHead.
 
@@ -128,7 +129,7 @@ def graph_to_tensors(
         containment_index     = torch.zeros((2, 0), dtype=torch.long, device=device)
         containment_zone_mult = torch.zeros(0, dtype=torch.float32, device=device)
 
-    # Bug 7 fix: attach topology_vecs when Oracle1Extended is available
+    # Attach topology_vecs when Oracle1Extended is available
     topology_vecs = None
     if extended is not None and hasattr(extended, "get_topology_vecs_tensor"):
         topology_vecs = extended.get_topology_vecs_tensor(node_ids, device=device)
