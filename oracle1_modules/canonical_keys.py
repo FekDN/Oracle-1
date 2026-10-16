@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Canonical key, alias, lookup-table, and semantic-hash primitives."""
 from __future__ import annotations
 
