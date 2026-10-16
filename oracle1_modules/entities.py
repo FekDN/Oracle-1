@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Graph node, edge, temporal, and feature data structures."""
 from __future__ import annotations
 
