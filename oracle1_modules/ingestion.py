@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Deduplication indexes, ingestion pipeline, and batch processing."""
 from __future__ import annotations
 
