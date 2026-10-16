@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Neural model components and their training losses."""
 from __future__ import annotations
 
