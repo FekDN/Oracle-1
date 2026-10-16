@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Ingest local documents and restructure the Oracle graph without neural training."""
 
 from __future__ import annotations
