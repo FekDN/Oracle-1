@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Convergence pressure, dormancy, and local graph dynamics."""
 from __future__ import annotations
 
