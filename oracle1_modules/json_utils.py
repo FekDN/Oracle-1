@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Robust parsing helpers for model-generated JSON."""
 from __future__ import annotations
 
