@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Document chunking, prompts, annotation, and response validation."""
 from __future__ import annotations
 
