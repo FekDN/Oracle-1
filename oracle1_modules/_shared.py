@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Shared standard-library, numerical, and optional PyTorch dependencies."""
 
 from __future__ import annotations
