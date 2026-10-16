@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Factory for constructing a fully wired Oracle-1 system."""
 from __future__ import annotations
 
