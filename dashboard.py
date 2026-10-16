@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Local control room for Oracle-1.
 
 The server binds to 127.0.0.1 by default and starts no external services.
