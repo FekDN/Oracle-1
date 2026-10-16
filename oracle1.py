@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Compatibility facade for the modular Oracle-1 implementation.
 
 Existing scripts can continue importing from ``oracle1`` while implementation
