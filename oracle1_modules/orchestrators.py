@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """High-level dynamics and topology orchestration."""
 from __future__ import annotations
 
