@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Graph snapshots and temporal-window persistence."""
 from __future__ import annotations
 
