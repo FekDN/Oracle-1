@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Runtime graph storage, ancestry checks, and traversal."""
 from __future__ import annotations
 
