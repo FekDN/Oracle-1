@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Epistemic scoring and concept significance processing."""
 from __future__ import annotations
 
