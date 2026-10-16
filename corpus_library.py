@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Persistent local document library for Oracle-1 ingestion.
 
 The queue is intentionally separate from the graph.  The graph answers
