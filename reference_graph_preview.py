@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
 """Build an auditable citation-only graph preview from local PDF references.
 
 This is a seed for extending a corpus, not a substitute for article analysis:
@@ -6,7 +7,7 @@ References section. OpenAlex is used for bibliographic labels and publication
 years; it does not provide semantic/causal edge judgments here.
 
 Example:
-    python reference_graph_preview.py --corpus-dir "C:\\Users\\F\\Desktop\\зубы"
+    python reference_graph_preview.py --corpus-dir 
     python visualizer_server.py --snapshot artifacts/reference_preview/graph_snapshot.pkl --port 50510
 """
 
